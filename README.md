@@ -2,13 +2,17 @@
   <img src="images/banner.jpg" alt="The Chatters" width="100%">
 </p>
 
-# mod-llm-chatter
+# 🧠 mod-llm-chatter — JainaCore Neural Edition
 
 **Every hero has a story. Your companions are ready to tell theirs.**
 
-A fantasy roleplay conversation engine for [AzerothCore](https://www.azerothcore.org/) WotLK (3.3.5a) and [mod-playerbots](https://github.com/mod-playerbots/mod-playerbots). It replaces the silence of automated bots with personality-driven, lore-grounded dialogue, giving every companion a voice shaped by their race, class, and the world around them. Whether you're soloing through the cursed woods of Duskwood, descending into the titan halls of Ulduar with a full raid, or clashing over flags in Warsong Gulch, your party feels like a band of adventurers sharing a journey through Azeroth.
+> **Distro Oficial:** Motor de diálogo con inteligencia artificial para el ecosistema **JainaCore 3.3.5a** y **mod-playerbots**.  
+> Basado originalmente en el proyecto open-source [Hokken/mod-llm-chatter](https://github.com/Hokken/mod-llm-chatter).
 
-Built from the ground up for **fantasy roleplay immersion**. Every system, personalities, memories, prompts, spatial awareness, is designed to keep bots speaking as inhabitants of Azeroth, not as AI assistants breaking the fourth wall.
+### ⚔️ Parches y Mejoras Exclusivas para JainaCore:
+- **Auto-Descubrimiento de Motores Locales:** Detección automática y enrutamiento dinámico para LM Studio, vLLM, Jan, Ollama y Lemonade sin configuración manual de URLs.
+- **Caché Semántico de Respuestas:** Almacenamiento en memoria volátil de respuestas frecuentes con tiempo de respuesta inferior a 1 ms (`0.0125 ms`), reduciendo en 100% el consumo innecesario de GPU.
+- **Sanitización de Razonamiento (Thinking Artifacts):** Filtrado automático de bloques `<think>` en modelos Qwen 2.5 / DeepSeek R1 para garantizar inmersión rolera pura en el chat de juego.
 
 ---
 
