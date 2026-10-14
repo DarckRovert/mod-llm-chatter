@@ -1,0 +1,152 @@
+#ifndef MOD_LLM_CHATTER_SHARED_H
+#define MOD_LLM_CHATTER_SHARED_H
+
+#include "DatabaseEnvFwd.h"
+#include "Define.h"
+#include "SharedDefines.h"
+#include <ctime>
+#include <map>
+#include <string>
+#include <vector>
+
+class Channel;
+class Creature;
+class Group;
+class Map;
+class Player;
+class Unit;
+
+enum class LLMChatterPriorityBand : uint8
+{
+    Filler = 0,
+    Normal = 10,
+    High = 20,
+    // Intra-tier ordering values such as 21 are kept in the
+    // implementation file for narrow local ordering cases.
+    Critical = 30
+};
+
+bool IsPlayerBot(Player* player);
+// True when `viewer` can currently perceive `unit`: both in
+// the world, same map and instance, within the viewer's
+// visibility range, and passing stealth/invisibility
+// detection. Use before naming a unit in any prompt.
+bool IsUnitPerceivableBy(Player* viewer, Unit* unit);
+bool IsInOverworld(Player* player);
+bool IsGroupedWithRealPlayer(Player* player);
+void RefreshGeneralAudienceSnapshot();
+bool HasCachedGeneralAudience(
+    uint32 mapId, uint32 zoneId, TeamId teamId);
+std::vector<uint32> GetCachedGeneralAudienceZones();
+std::string const& GetCreatureEntryColumn();
+Creature* FindCreatureBySpawnId(Map* map, uint32 spawnId);
+void LoadNamedBossCache();
+bool IsLLMChatterBoss(Creature const* creature);
+bool IsLLMChatterInternalCreature(Creature const* creature);
+
+// Strip invalid UTF-8 byte sequences, preserving every
+// valid UTF-8 run. Returns input unchanged when already
+// valid. Used as the universal guard before any SQL/JSON
+// write so invalid bytes (e.g. 0xFF) cannot reach MySQL.
+std::string SanitizeUtf8(const std::string& str);
+
+// SanitizeUtf8 + codepoint-safe truncation to maxChars
+// (0 = no truncation). Single entry point for all
+// length-clamped, DB-bound text.
+std::string NormalizeChatTextForDb(
+    const std::string& str, size_t maxChars = 0);
+
+std::string EscapeString(const std::string& str);
+std::string JsonEscape(const std::string& str);
+std::string GetCreatureRoleName(Creature* creature);
+std::string GetChatterClassName(uint8 classId);
+std::string GetRaceName(uint8 raceId);
+std::string BuildBotIdentityFields(
+    Player* player, bool includeRoles = false);
+std::string BuildBotStateJson(Player* player);
+std::string BuildBotTravelStateJson(Player* player);
+std::string GetBotTravelContext(Player* player);
+std::string GetBotTravelMode(Player* player);
+bool HasUnsafeChatterFacingMotion(Unit* unit);
+bool IsSafeForChatterFacing(Unit* unit);
+void UpdateGroupBotTravelState(Player* player, uint32 groupId = 0);
+std::string ConvertAllLinks(const std::string& text);
+std::string GetZoneName(uint32 zoneId);
+uint32 GetTextEmoteId(const std::string& emoteName);
+bool IsBGAllowedEmote(const std::string& emoteName);
+void PlayUnitTextEmoteAnimation(Unit* unit, uint32 textEmoteId);
+void SendUnitTextEmote(Unit* unit, uint32 textEmoteId,
+                       const std::string& targetName = "");
+void SendBotTextEmote(Player* bot, uint32 textEmoteId);
+void SendBotTextEmote(Player* bot, uint32 textEmoteId,
+                      const std::string& targetName);
+
+std::string GetTextEmoteName(uint32 emoteId);
+void SendPartyMessageInstant(
+    Player* bot, Group* group,
+    const std::string& message,
+    const std::string& emote);
+void RecordPartyChatGateActivity(
+    uint32 groupId,
+    const std::string& deliveryPolicy,
+    const std::string& deliveryReason);
+void EnsureBotInGeneralChannel(Player* bot);
+bool IsPlayerInChannel(Player const* player, Channel const* channel);
+bool CanSpeakInGeneralChannel(Player* bot);
+bool IsEventOnCooldown(
+    std::map<std::string, time_t>& cooldownCache,
+    const std::string& cooldownKey,
+    uint32 cooldownSeconds);
+bool IsPersistedEventOnCooldown(
+    std::string const& cooldownKey,
+    uint32 cooldownSeconds);
+void SetEventCooldown(
+    std::map<std::string, time_t>& cooldownCache,
+    const std::string& cooldownKey);
+uint32 SelectConversationParticipantCount(
+    uint32 available, uint32 maximum);
+void LogIgnoredAddonChat(
+    Player const* player, uint32 type,
+    std::string const& msg, char const* source);
+// NOTE: extraData must already be valid JSON text and SQL-safe for
+// direct insertion into a single-quoted SQL string literal.
+void QueueChatterEvent(
+    const std::string& eventType,
+    const std::string& eventScope,
+    uint32 zoneId, uint32 mapId, uint8 priority,
+    const std::string& cooldownKey,
+    uint32 subjectGuid, const std::string& subjectName,
+    uint32 targetGuid, const std::string& targetName,
+    uint32 targetEntry, const std::string& extraData,
+    uint32 reactAfterSeconds,
+    uint32 expiresAfterSeconds,
+    bool nullZeroNumeric);
+// Same row as QueueChatterEvent(), appended to `trans` so the event
+// exists only if the rest of that transaction commits.
+void AppendChatterEvent(
+    CharacterDatabaseTransaction trans,
+    std::string const& eventType,
+    std::string const& eventScope,
+    uint32 zoneId, uint32 mapId, uint8 priority,
+    std::string const& cooldownKey,
+    uint32 subjectGuid, std::string const& subjectName,
+    uint32 targetGuid, std::string const& targetName,
+    uint32 targetEntry, std::string const& extraData,
+    uint32 reactAfterSeconds,
+    uint32 expiresAfterSeconds,
+    bool nullZeroNumeric);
+void AppendRaidContext(Player* player, std::string& json);
+bool GroupHasBots(Group* group);
+Player* FindMentionedMember(
+    Player* bot, Group* grp,
+    const std::string& message);
+Player* FindNearbyDefenderBot(
+    Player* intruder, uint32 zoneId,
+    TeamId defenderTeam);
+uint8 GetChatterEventPriority(
+    const std::string& eventType);
+uint32 GetReactionDelaySeconds(const std::string& eventType);
+void AddLLMChatterPlayerScripts();
+void AddLLMChatterWorldScripts();
+
+#endif

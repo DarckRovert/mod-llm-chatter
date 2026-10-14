@@ -1,0 +1,2957 @@
+"""
+Chatter Prompts - Prompt builders and creative selection for LLM Chatter Bridge.
+
+Imports from chatter_constants and chatter_shared.
+"""
+
+import collections
+import logging
+import random
+from datetime import datetime
+from typing import List, Tuple
+
+from chatter_constants import (
+    TONES, CREATIVE_TWISTS, MESSAGE_CATEGORIES,
+    GOSSIP_CREATIVE_TWISTS,
+    LENGTH_HINTS,
+    RP_TONES, RP_CREATIVE_TWISTS,
+    RP_GOSSIP_CREATIVE_TWISTS,
+    RP_MESSAGE_CATEGORIES, RP_LENGTH_HINTS,
+    PERSONALITY_SPICES, RP_PERSONALITY_SPICES,
+    CLASS_NAMES, RACE_NAMES, CLASS_ROLE_MAP,
+)
+from chatter_shared import (
+    get_chatter_mode, build_race_class_context,
+    build_race_class_context_parts,
+    build_bot_identity,
+    get_zone_flavor, format_price,
+    build_anti_repetition_context,
+    append_json_instruction,
+    append_conversation_json_instruction,
+    select_conversation_message_count,
+    get_subzone_name, get_subzone_lore,
+    append_speaker_gear,
+)
+from chatter_mode import (
+    build_player_chat_guidance,
+    build_player_prompt_header,
+)
+from chatter_threads import (
+    THREAD_REPORT_FIELD,
+    THREAD_REPORT_OBJECT,
+    THREAD_REPORT_RULE,
+)
+from chatter_persona import (
+    build_cast_lines,
+    build_persona_block,
+    persona_for_bot,
+    persona_from_fields,
+)
+
+logger = logging.getLogger(__name__)
+
+# Recency buffer so the same spice doesn't repeat
+# across consecutive calls.
+_recent_spices = collections.deque(maxlen=30)
+
+# Flavor settings, loaded once from the bridge config
+# by configure_prompt_flavor(). Spice count keeps its
+# meaning ("how many, when spices are used"); spice
+# chance decides whether a prompt gets any at all.
+_spice_count = 2
+_spice_chance = 30
+_twist_chance = 25
+
+TWIST_LABEL = (
+    "Optional angle (use only if it fits your "
+    "personality)"
+)
+TWIST_LABEL_CONVERSATION = (
+    "Optional angle for this conversation (use only "
+    "where it fits each speaker's personality)"
+)
+
+
+def _clamped_int(config, key, default, low, high):
+    try:
+        value = int(config.get(key, default))
+    except (TypeError, ValueError, AttributeError):
+        logger.error("Failed to parse %s", key)
+        value = default
+    return max(low, min(value, high))
+
+
+def configure_prompt_flavor(config) -> None:
+    """Load spice/twist settings from the bridge config."""
+    global _spice_count, _spice_chance, _twist_chance
+    config = config or {}
+    _spice_count = _clamped_int(
+        config, 'LLMChatter.PersonalitySpiceCount', 2, 0, 5
+    )
+    _spice_chance = _clamped_int(
+        config, 'LLMChatter.Persona.SpiceChance', 30, 0, 100
+    )
+    _twist_chance = _clamped_int(
+        config, 'LLMChatter.Persona.TwistChance', 25, 0, 100
+    )
+
+
+# =============================================================================
+# PERSONALITY SPICE PICKER
+# =============================================================================
+def pick_personality_spices(
+    config=None, mode='normal',
+    spice_count_override=None,
+):
+    """Pick N random personality spices, avoiding
+    recent repeats.
+
+    Args:
+        config: config dict (reads PersonalitySpiceCount)
+        mode: 'normal' or 'roleplay'
+        spice_count_override: explicit count (0-5),
+            takes priority over config
+    Returns:
+        list of spice strings (may be empty)
+    """
+    # Determine count
+    if spice_count_override is not None:
+        count = spice_count_override
+    elif config is not None:
+        try:
+            count = int(config.get(
+                'LLMChatter.PersonalitySpiceCount', 2
+            ))
+        except Exception:
+            count = 2
+    else:
+        count = _spice_count
+    count = max(0, min(count, 5))
+    if count == 0:
+        return []
+
+    pool = (
+        RP_PERSONALITY_SPICES
+        if mode == 'roleplay'
+        else PERSONALITY_SPICES
+    )
+
+    # Filter out recently used spices
+    recent_set = set(_recent_spices)
+    available = [s for s in pool if s not in recent_set]
+
+    # If not enough available, clear recency buffer
+    if len(available) < count:
+        _recent_spices.clear()
+        available = list(pool)
+
+    picked = random.sample(
+        available, min(count, len(available))
+    )
+    _recent_spices.extend(picked)
+    return picked
+
+
+def maybe_pick_personality_spices(mode='normal'):
+    """Pick spices only when the SpiceChance roll passes.
+
+    Returns an empty list when spices are skipped.
+    """
+    if _spice_count <= 0 or _spice_chance <= 0:
+        return []
+    if random.randint(1, 100) > _spice_chance:
+        return []
+    return pick_personality_spices(
+        mode=mode, spice_count_override=_spice_count
+    )
+
+
+def format_spices_line(spices) -> str:
+    """Render spices as subordinate background texture."""
+    if not spices:
+        return ''
+    return (
+        "Background feelings (texture only, and only where "
+        "they fit your personality; ignore any that "
+        "contradict it): " + "; ".join(spices)
+    )
+
+
+# =============================================================================
+# CREATIVE SELECTION FUNCTIONS
+# =============================================================================
+def pick_random_tone(mode: str = 'normal') -> str:
+    """Pick a random tone for the message."""
+    pool = RP_TONES if mode == 'roleplay' else TONES
+    return random.choice(pool)
+
+
+def maybe_get_creative_twist(
+    chance: float = None, mode: str = 'normal'
+) -> str:
+    """Maybe return a creative twist.
+
+    ``chance`` defaults to LLMChatter.Persona.TwistChance.
+    """
+    if chance is None:
+        chance = _twist_chance / 100.0
+    if random.random() < chance:
+        pool = (
+            RP_CREATIVE_TWISTS if mode == 'roleplay'
+            else CREATIVE_TWISTS
+        )
+        return random.choice(pool)
+    return None
+
+
+def maybe_get_gossip_creative_twist(
+    chance: float = None, mode: str = 'normal'
+) -> str:
+    """Maybe return a gossip-specific creative twist.
+
+    ``chance`` defaults to LLMChatter.Persona.TwistChance.
+    """
+    if chance is None:
+        chance = _twist_chance / 100.0
+    if random.random() < chance:
+        pool = (
+            RP_GOSSIP_CREATIVE_TWISTS
+            if mode == 'roleplay'
+            else GOSSIP_CREATIVE_TWISTS
+        )
+        return random.choice(pool)
+    return None
+
+
+def pick_random_message_category(mode: str = 'normal') -> str:
+    """Pick a random message category."""
+    pool = (
+        RP_MESSAGE_CATEGORIES if mode == 'roleplay'
+        else MESSAGE_CATEGORIES
+    )
+    return random.choice(pool)
+
+
+# Conversation length labels â€” short descriptions
+# mapped to rough character counts for the LLM.
+CONV_LENGTHS = [
+    "very short (under 40 chars)",
+    "short (40-70 chars)",
+    "medium (70-120 chars)",
+    "longer (120-150 chars max)",
+]
+# Weights favour shorter messages; keeps
+# conversations snappy and readable.
+CONV_LENGTH_WEIGHTS = [35, 35, 25, 5]
+
+
+def generate_conversation_length_sequence(
+    message_count: int,
+) -> List[str]:
+    """Generate per-message length targets so
+    conversations have varied message lengths
+    instead of uniform output."""
+    return random.choices(
+        CONV_LENGTHS,
+        weights=CONV_LENGTH_WEIGHTS,
+        k=message_count,
+    )
+
+
+# =============================================================================
+# ENVIRONMENTAL CONTEXT
+# =============================================================================
+def get_time_of_day_context() -> Tuple[str, str]:
+    """Get current time-of-day context for immersive conversations."""
+    hour = datetime.now().hour
+
+    if 5 <= hour < 7:
+        return (
+            "dawn",
+            "The early morning light is just appearing",
+        )
+    elif 7 <= hour < 9:
+        return ("early_morning", "It's early morning")
+    elif 9 <= hour < 12:
+        return ("morning", "The morning sun is up")
+    elif 12 <= hour < 14:
+        return ("midday", "It's around midday")
+    elif 14 <= hour < 17:
+        return ("afternoon", "It's afternoon")
+    elif 17 <= hour < 19:
+        return ("evening", "Evening is approaching")
+    elif 19 <= hour < 21:
+        return ("dusk", "The sun is setting")
+    elif 21 <= hour < 23:
+        return ("night", "Night has fallen")
+    elif hour == 23 or hour == 0:
+        return ("midnight", "It's late at night")
+    else:  # 1-4
+        return (
+            "late_night",
+            "It's the deep hours of night",
+        )
+
+
+def get_season_context() -> Tuple[str, str]:
+    """Get current season using AzerothCore weather season logic."""
+    day_of_year = datetime.now().timetuple().tm_yday - 1
+    season_index = ((day_of_year - 78 + 365) // 91) % 4
+    seasons = [
+        ("spring", "Spring is in the air"),
+        ("summer", "It is summer"),
+        ("fall", "It is fall"),
+        ("winter", "Winter has settled in"),
+    ]
+    return seasons[season_index]
+
+
+def get_environmental_context(
+    current_weather: str = None,
+    season_chance: float = 0.30,
+) -> dict:
+    """Get environmental context for prompts.
+
+    Time is always included. Season and weather are
+    included opportunistically to avoid repetitive
+    prompt patterns.
+    """
+    _, time_desc = get_time_of_day_context()
+    result = {
+        'time': time_desc,
+        'season': None,
+        'weather': None,
+    }
+
+    if current_weather and random.random() < 0.50:
+        result['weather'] = current_weather
+
+    if random.random() < season_chance:
+        _, season_desc = get_season_context()
+        result['season'] = season_desc
+
+    return result
+
+
+def build_environmental_context_lines(
+    current_weather: str = None
+) -> List[str]:
+    """Build prompt lines for shared environment context."""
+    env_context = get_environmental_context(current_weather)
+    lines = []
+    if env_context['time']:
+        lines.append(f"Time of day: {env_context['time']}")
+    if env_context['season']:
+        lines.append(f"Season: {env_context['season']}")
+    if env_context['weather']:
+        lines.append(
+            f"Current weather: {env_context['weather']}"
+        )
+    return lines
+
+
+def append_environmental_context(
+    parts: list, current_weather: str = None
+) -> None:
+    """Append shared environment context to prompt parts."""
+    parts.extend(build_environmental_context_lines(current_weather))
+
+
+# =============================================================================
+# DYNAMIC GUIDELINES
+# =============================================================================
+def build_dynamic_guidelines(
+    include_humor: bool = None,
+    include_length: bool = True,
+    config: dict = None,
+    mode: str = 'normal',
+    length_hint: str = "",
+) -> list:
+    """Build a randomized list of guidelines.
+
+    length_hint: if provided, overrides the random
+    length pool pick (caller pre-selected via RNG).
+    """
+    is_rp = (mode == 'roleplay')
+
+    if is_rp:
+        guidelines = [
+            "Stay in character but keep it natural and "
+            "conversational, not dramatic or theatrical",
+            "ALWAYS write in first person - you ARE the "
+            "character speaking. Your message should be "
+            "SPOKEN words only (actions go in the "
+            "\"action\" JSON field, not in the message).",
+            "NEVER use brackets [] around names "
+            "(quests, items, zones, creatures, NPCs, "
+            "factions) - write everything as plain "
+            "text. Only use {quest:Name}, "
+            "{item:Name}, or {spell:Name} "
+            "placeholders when explicitly told to.",
+        ]
+    else:
+        guidelines = [
+            build_player_chat_guidance(mode, 'general'),
+            "NEVER use brackets [] around names "
+            "(quests, items, zones, creatures, NPCs, "
+            "factions) - write everything as plain "
+            "text. Only use {quest:Name}, "
+            "{item:Name}, or {spell:Name} "
+            "placeholders when explicitly told to.",
+            "Prefer full words over internet slang "
+            "— use abbreviations sparingly, not in "
+            "every message (lol, omg, ngl, tbh are "
+            "ok occasionally). Basic WoW terms are "
+            "always fine (dps, tank, healer, gg, "
+            "buff, nerf, aggro).",
+        ]
+
+    length_pool = RP_LENGTH_HINTS if is_rp else LENGTH_HINTS
+    if include_length:
+        picked = length_hint or random.choice(
+            length_pool
+        )
+        guidelines.append(
+            f"Length: {picked}"
+        )
+        long_chance = 15 if is_rp else 12
+        if config is not None:
+            try:
+                long_chance = int(
+                    config.get(
+                        'LLMChatter.LongMessageChance',
+                        long_chance
+                    )
+                )
+                if is_rp:
+                    long_chance = min(long_chance + 5, 30)
+            except Exception:
+                pass
+        if random.randint(1, 100) <= long_chance:
+            guidelines.append(
+                "Length mode: longer allowed "
+                "(up to ~150 chars max) if it "
+                "feels natural — one sentence"
+            )
+        else:
+            guidelines.append(
+                "Length mode: short/medium only "
+                "(avoid long messages)"
+            )
+        guidelines.append(
+            "HARD LIMIT: Never exceed 150 "
+            "characters total"
+        )
+
+    if include_humor is None:
+        include_humor = random.random() < (
+            0.35 if is_rp else 0.40
+        )
+    if include_humor:
+        if is_rp:
+            guidelines.append(
+                "A touch of wry or dry humor fits here, "
+                "if it suits the speaker's personality"
+            )
+        else:
+            guidelines.append(
+                "A touch of humor fits here, if it suits "
+                "the speaker's personality"
+            )
+
+    if is_rp:
+        extras = [
+            "Let your race flavor your words subtly, "
+            "not heavily",
+            "Keep it simple - like a real person talking, "
+            "just in-character",
+            "A small detail about the surroundings is nice",
+            "Casual and grounded, not poetic or flowery",
+        ]
+    else:
+        extras = [
+            "Common terms ok (lfg, lf, ty, np)",
+            "Can include a typo for realism",
+            "Casual and natural chat style",
+            "Brief and direct",
+        ]
+    if random.random() < 0.5:
+        guidelines.append(random.choice(extras))
+
+    spice_line = format_spices_line(
+        maybe_pick_personality_spices(mode)
+    )
+    if spice_line:
+        guidelines.append(spice_line)
+
+    return guidelines
+
+
+# =============================================================================
+# PROMPT BUILDERS
+# =============================================================================
+def build_plain_statement_prompt(
+    bot: dict,
+    zone_id: int = 0,
+    zone_mobs: list = None,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    topic: str = None,
+    area_id: int = 0,
+    length_hint: str = "",
+    thread_turn=None,
+) -> str:
+    """Build a dynamically varied prompt for a plain statement."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    parts = []
+
+    if is_rp:
+        identity = build_bot_identity(
+            bot['name'],
+            bot.get('race', ''),
+            bot.get('class', ''),
+            bot.get('gender', ''),
+            gear=bot.get('gear', ''),
+        )
+        parts.append(
+            f"{identity} "
+            f"Speak in-character in General chat in "
+            f"{bot['zone']}."
+        )
+        rp_ctx = build_race_class_context(
+            bot.get('race', ''), bot.get('class', '')
+        )
+        if rp_ctx:
+            parts.append(rp_ctx)
+    else:
+        parts.append(
+            f"Generate a brief WoW General chat message "
+            f"from a player in {bot['zone']}. Speak as "
+            f"a player talking about the game — not "
+            f"roleplaying your character."
+        )
+
+    if topic:
+        parts.append(f"Topic: {topic}")
+    # The zone channel's conversation thread replaces the
+    # random topic (the caller then passes topic=None).
+    if thread_turn is not None:
+        parts.append(thread_turn.prompt_block)
+
+    zone_flavor = get_zone_flavor(zone_id)
+    if is_rp and zone_flavor:
+        parts.append(f"Zone context: {zone_flavor}")
+
+    # Subzone context (matches group idle pattern)
+    sz_lore = get_subzone_lore(zone_id, area_id)
+    if is_rp and sz_lore:
+        parts.append(
+            f"Current subzone: {sz_lore}"
+        )
+    else:
+        sz_name = get_subzone_name(
+            zone_id, area_id
+        )
+        if sz_name:
+            parts.append(f"Subzone: {sz_name}")
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    if random.random() < 0.6:
+        parts.append(f"Player level: {bot['level']}")
+
+    if zone_mobs:
+        parts.append(
+            f"Creatures here: {', '.join(zone_mobs)}"
+        )
+        parts.append(
+            "IMPORTANT: If mentioning any creature, ONLY use "
+            "ones from the list above. Write creature names "
+            "as plain text, never in brackets."
+        )
+
+    parts.append(
+        build_persona_block(persona_for_bot(bot, mode), mode)
+    )
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(f"{TWIST_LABEL}: {twist}")
+
+    category = pick_random_message_category(mode)
+    parts.append(f"Message type: {category}")
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode,
+        length_hint=length_hint,
+    )
+    guidelines.append(
+        "Plain text only - never wrap creature, NPC, "
+        "zone, or faction names in brackets"
+    )
+    if is_rp:
+        guidelines.append(
+            "Stay in character but sound natural, "
+            "not theatrical"
+        )
+        guidelines.append(
+            "No game terms, abbreviations, "
+            "or OOC references"
+        )
+    else:
+        guidelines.append(
+            "Speak as a player discussing the game — "
+            "you can mention your race, class, zone, "
+            "or abilities, but as a player, not as "
+            "your character roleplaying"
+        )
+    guidelines.append(
+        "Be ORIGINAL and UNPREDICTABLE - no common patterns, "
+        "surprise the reader"
+    )
+    if zone_mobs:
+        guidelines.append(
+            "Only mention creatures from the provided list "
+            "- do NOT invent creatures"
+        )
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages,
+        allow_same_subject=bool(
+            thread_turn and thread_turn.builds_on_subject
+        ),
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    if thread_turn is not None:
+        return append_json_instruction(
+            prompt, allow_action, skip_emote=True,
+            extra_field=THREAD_REPORT_FIELD,
+            include_thread=True,
+            thread_speaker_names=(bot['name'],),
+            extra_rule=THREAD_REPORT_RULE,
+        )
+    return append_json_instruction(
+        prompt, allow_action, skip_emote=True
+    )
+
+
+def build_quest_statement_prompt(
+    bot: dict,
+    quest: dict,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    zone_id: int = 0,
+) -> str:
+    """Build a dynamically varied prompt for a quest statement."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    parts = []
+
+    if is_rp:
+        identity = build_bot_identity(
+            bot['name'],
+            bot.get('race', ''),
+            bot.get('class', ''),
+            bot.get('gender', ''),
+            gear=bot.get('gear', ''),
+        )
+        parts.append(
+            f"{identity} Speak in-character about "
+            f"a quest in {bot['zone']}."
+        )
+        rp_ctx = build_race_class_context(
+            bot.get('race', ''), bot.get('class', '')
+        )
+        if rp_ctx:
+            parts.append(rp_ctx)
+    else:
+        parts.append(
+            "Generate a brief WoW General chat message "
+            "mentioning a quest."
+        )
+        parts.append(f"Zone: {bot['zone']}")
+
+    zone_flavor = get_zone_flavor(zone_id)
+    if is_rp and zone_flavor:
+        parts.append(f"Zone context: {zone_flavor}")
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    if random.random() < 0.5:
+        parts.append(f"Player level: {bot['level']}")
+
+    quest_placeholder = f"{{quest:{quest['quest_name']}}}"
+    parts.append(f"Quest: {quest['quest_name']}")
+    parts.append(
+        f"REQUIRED: Include exactly "
+        f"{quest_placeholder} in the \"message\" "
+        f"JSON field (NOT in the action). "
+        f"This becomes a clickable link"
+    )
+
+    if quest.get('description') and random.random() < 0.4:
+        parts.append(
+            f"Quest involves: {quest['description'][:80]}"
+        )
+
+    parts.append(
+        build_persona_block(persona_for_bot(bot, mode), mode)
+    )
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(f"{TWIST_LABEL}: {twist}")
+
+    if is_rp:
+        quest_actions = [
+            "seeking guidance on the task",
+            "reflecting on the quest's meaning",
+            "warning of the dangers involved",
+            "rallying companions for the undertaking",
+            "musing on the reward awaiting",
+        ]
+    else:
+        quest_actions = [
+            "asking where to find it",
+            "asking for help",
+            "complaining about difficulty",
+            "celebrating completion",
+            "asking about rewards",
+            "warning others about it",
+            "looking for group",
+        ]
+    if random.random() < 0.6:
+        parts.append(
+            f"Approach: {random.choice(quest_actions)}"
+        )
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append(
+        "STRICT: Keep under 80 characters "
+        "(the link counts as ~15 chars)"
+    )
+    if is_rp:
+        guidelines.append(
+            "Stay in character but sound natural, "
+            "not theatrical"
+        )
+    guidelines.append("Be creative and unpredictable")
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_json_instruction(
+        prompt, allow_action, skip_emote=True
+    )
+
+
+def build_loot_statement_prompt(
+    bot: dict,
+    item: dict,
+    can_use: bool,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    zone_id: int = 0,
+) -> str:
+    """Build a dynamically varied prompt for a loot statement."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    quality_names = {
+        0: "poor", 1: "common", 2: "uncommon",
+        3: "rare", 4: "epic", 5: "legendary",
+        6: "artifact", 7: "heirloom",
+    }
+    quality = quality_names.get(
+        item.get('item_quality', 2), "uncommon"
+    )
+
+    parts = []
+    item_placeholder = f"{{item:{item['item_name']}}}"
+
+    if is_rp:
+        identity = build_bot_identity(
+            bot['name'],
+            bot.get('race', ''),
+            bot.get('class', ''),
+            bot.get('gender', ''),
+            gear=bot.get('gear', ''),
+        )
+        parts.append(
+            f"{identity} Speak in-character about "
+            f"finding loot."
+        )
+        rp_ctx = build_race_class_context(
+            bot.get('race', ''), bot.get('class', '')
+        )
+        if rp_ctx:
+            parts.append(rp_ctx)
+    else:
+        parts.append(
+            "Generate a brief WoW General chat message "
+            "about a loot drop."
+        )
+
+    zone_flavor = get_zone_flavor(zone_id)
+    if is_rp and zone_flavor:
+        parts.append(f"Zone context: {zone_flavor}")
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    parts.append(
+        f"Item: {item['item_name']} ({quality} quality)"
+    )
+    item_count = max(1, int(item.get('item_count', 1)))
+    if item_count > 1:
+        parts.append(
+            f"Quantity actually looted: {item_count}. "
+            "If quantity is mentioned, it must be exact"
+        )
+    parts.append(
+        f"REQUIRED: Include exactly "
+        f"{item_placeholder} in the \"message\" "
+        f"JSON field (this becomes a clickable "
+        f"link). NEVER put it in the action field"
+    )
+
+    if random.random() < 0.6:
+        parts.append(f"Player class: {bot['class']}")
+        if random.random() < 0.4:
+            usability = (
+                "can equip"
+                if can_use
+                else "cannot equip (wrong class)"
+            )
+            parts.append(f"Class fit: {usability}")
+
+    parts.append(
+        build_persona_block(persona_for_bot(bot, mode), mode)
+    )
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(f"{TWIST_LABEL}: {twist}")
+
+    if is_rp:
+        reactions = [
+            "impressed by the quality of the item",
+            "wondering if the item suits your path",
+            "offering it to anyone who could use it",
+            "commenting on your luck today",
+            "mentioning what you think of the item",
+        ]
+    else:
+        reactions = [
+            "excitement about the drop",
+            "meh, vendor fodder",
+            "offering to trade/give away",
+            "commenting on luck",
+            "just mentioning what dropped",
+            "comparing to previous drops",
+            "wondering about the item",
+        ]
+    parts.append(f"Reaction style: {random.choice(reactions)}")
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append(
+        "STRICT: Keep under 80 characters "
+        "(the link counts as ~15 chars)"
+    )
+    if is_rp:
+        guidelines.append(
+            "Stay in character but sound natural, "
+            "not theatrical"
+        )
+    guidelines.append("Be creative and unpredictable")
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_json_instruction(
+        prompt, allow_action, skip_emote=True
+    )
+
+
+def build_quest_reward_statement_prompt(
+    bot: dict,
+    quest: dict,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    zone_id: int = 0,
+) -> str:
+    """Build a prompt for quest completion with reward."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+
+    item_name = (
+        quest.get('item1_name') or quest.get('item2_name')
+    )
+    item_quality = (
+        quest.get('item1_quality')
+        or quest.get('item2_quality')
+        or 2
+    )
+
+    if not item_name:
+        return build_quest_statement_prompt(
+            bot, quest, config, current_weather,
+            recent_messages=recent_messages,
+            speaker_talent_context=(
+                speaker_talent_context
+            ),
+            zone_id=zone_id,
+        )
+
+    quality_names = {
+        0: "gray", 1: "white", 2: "green",
+        3: "blue", 4: "purple",
+    }
+    quality = quality_names.get(item_quality, "green")
+
+    parts = []
+
+    if is_rp:
+        identity = build_bot_identity(
+            bot['name'],
+            bot.get('race', ''),
+            bot.get('class', ''),
+            bot.get('gender', ''),
+            gear=bot.get('gear', ''),
+        )
+        parts.append(
+            f"{identity} Speak in-character about "
+            f"completing a quest and its reward."
+        )
+        rp_ctx = build_race_class_context(
+            bot.get('race', ''), bot.get('class', '')
+        )
+        if rp_ctx:
+            parts.append(rp_ctx)
+    else:
+        parts.append(
+            "Generate a brief WoW General chat message "
+            "about finishing a quest."
+        )
+
+    zone_flavor = get_zone_flavor(zone_id)
+    if is_rp and zone_flavor:
+        parts.append(f"Zone context: {zone_flavor}")
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    parts.append(
+        f"Quest: {quest['quest_name']} "
+        f"(use {{quest:{quest['quest_name']}}} placeholder)"
+    )
+    parts.append(
+        f"Reward: {item_name} ({quality}) "
+        f"(use {{item:{item_name}}} placeholder)"
+    )
+
+    if random.random() < 0.5:
+        parts.append(f"Player class: {bot['class']}")
+
+    parts.append(
+        build_persona_block(persona_for_bot(bot, mode), mode)
+    )
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(f"{TWIST_LABEL}: {twist}")
+
+    if is_rp:
+        reactions = [
+            "feeling satisfied about finishing",
+            "commenting on the reward you received",
+            "mentioning the journey it took",
+            "thanking those who helped along the way",
+        ]
+    else:
+        reactions = [
+            "relief at finishing",
+            "excitement about reward",
+            "meh about the reward",
+            "just noting completion",
+            "sharing the achievement",
+        ]
+    if random.random() < 0.5:
+        parts.append(
+            f"Reaction: {random.choice(reactions)}"
+        )
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append(
+        "Use BOTH placeholders, each once, "
+        "in the \"message\" field only "
+        "(NOT in the action)"
+    )
+    guidelines.append(
+        "STRICT: Keep under 80 characters "
+        "(the link counts as ~15 chars)"
+    )
+    if is_rp:
+        guidelines.append(
+            "Stay in character but sound natural, "
+            "not theatrical"
+        )
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_json_instruction(
+        prompt, allow_action, skip_emote=True
+    )
+
+
+def build_plain_conversation_prompt(
+    bots: List[dict],
+    zone_id: int = 0,
+    zone_mobs: list = None,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    topic: str = None,
+    area_id: int = 0,
+    thread_turn=None,
+) -> str:
+    """Build a prompt for a plain conversation with 2-4 bots."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    parts = []
+    bot_count = len(bots)
+    bot_names = [b['name'] for b in bots]
+
+    if is_rp:
+        parts.append(
+            f"Generate an in-character General chat exchange "
+            f"between {bot_count} adventurers in "
+            f"{bots[0]['zone']}. Each speaks as their "
+            f"race and class."
+        )
+    elif bot_count == 2:
+        parts.append(
+            f"Generate a casual General chat exchange between "
+            f"two WoW players in {bots[0]['zone']}. "
+            f"They speak as players discussing the game, "
+            f"not roleplaying their characters."
+        )
+    else:
+        parts.append(
+            f"Generate a casual General chat exchange between "
+            f"{bot_count} WoW players in {bots[0]['zone']}. "
+            f"They speak as players discussing the game, "
+            f"not roleplaying their characters."
+        )
+
+    if topic:
+        parts.append(f"Topic: {topic}")
+    if thread_turn is not None:
+        parts.append(thread_turn.prompt_block)
+
+    zone_flavor = get_zone_flavor(zone_id)
+    if is_rp and zone_flavor:
+        parts.append(f"Zone context: {zone_flavor}")
+
+    # Subzone context (matches group idle pattern)
+    sz_lore = get_subzone_lore(zone_id, area_id)
+    if is_rp and sz_lore:
+        parts.append(
+            f"Current subzone: {sz_lore}"
+        )
+    else:
+        sz_name = get_subzone_name(
+            zone_id, area_id
+        )
+        if sz_name:
+            parts.append(f"Subzone: {sz_name}")
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    parts.append(f"Speakers: {', '.join(bot_names)}")
+    parts.append(
+        "Names: Sometimes use their name when addressing "
+        "directly (maybe 1-2 times in a conversation), but "
+        "not every message - vary it naturally."
+    )
+
+    # Precompute shared race context once per unique race.
+    # Pass race_count so lore uses cumulative probability
+    # 1-(1-p)^n, preserving pre-dedup lore frequency.
+    shared_race_cache = {}
+    if is_rp:
+        race_counts = {}
+        for bot in bots:
+            r = bot.get('race', '')
+            if r:
+                race_counts[r] = race_counts.get(r, 0) + 1
+        for race, count in race_counts.items():
+            _, sr, _ = build_race_class_context_parts(
+                race, '', race_count=count
+            )
+            shared_race_cache[race] = sr
+
+    seen_races = set()
+    seen_classes = set()
+    for bot in bots:
+        if is_rp or random.random() < 0.4:
+            race = bot.get('race', '')
+            cls = bot.get('class', '')
+            parts.append(
+                f"{bot['name']} is a {race} {cls}"
+            )
+            append_speaker_gear(parts, bot)
+            if is_rp:
+                per_bot, _, shared_class = (
+                    build_race_class_context_parts(
+                        race, cls
+                    )
+                )
+                if per_bot:
+                    parts.append(f"  {per_bot}")
+                if race not in seen_races:
+                    sr = shared_race_cache.get(
+                        race, ''
+                    )
+                    if sr:
+                        parts.append(
+                            f"  {sr}"
+                        )
+                    seen_races.add(race)
+                if cls not in seen_classes:
+                    if shared_class:
+                        parts.append(
+                            f"  {shared_class}"
+                        )
+                    seen_classes.add(cls)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    if zone_mobs:
+        parts.append(
+            f"Creatures here: {', '.join(zone_mobs)}"
+        )
+        parts.append(
+            "IMPORTANT: If mentioning any creature, ONLY use "
+            "ones from the list above. Write creature names "
+            "as plain text, never in brackets."
+        )
+
+    parts.extend(build_cast_lines(
+        [persona_for_bot(b, mode) for b in bots], mode
+    ))
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(
+            f"{TWIST_LABEL_CONVERSATION}: {twist}"
+        )
+
+    min_msgs = bot_count
+    max_msgs = bot_count + 3
+    msg_count = select_conversation_message_count(
+        bot_count, min_msgs, max_msgs
+    )
+    length_sequence = generate_conversation_length_sequence(
+        msg_count
+    )
+
+    parts.append(
+        "\nLENGTH SEQUENCE "
+        "(follow this for each message):"
+    )
+    for i, length in enumerate(length_sequence):
+        speaker = bot_names[i % bot_count]
+        parts.append(
+            f"  Message {i+1} ({speaker}): "
+            f"length={length}"
+        )
+
+    if is_rp:
+        topics = [
+            "discussing the dangers of these lands",
+            "sharing tales of past battles",
+            "debating the best path forward",
+            "exchanging news from distant regions",
+            "reflecting on the state of the war",
+        ]
+    else:
+        topics = [
+            "asking for directions or help",
+            "chatting about the zone",
+            "looking for group",
+            "sharing tips",
+            "random banter",
+            "complaining about something",
+            "celebrating something",
+        ]
+    if thread_turn is None and random.random() < 0.5:
+        parts.append(
+            f"Topic hint: {random.choice(topics)}"
+        )
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append(
+        "Plain text only - never wrap creature, NPC, "
+        "zone, or faction names in brackets"
+    )
+    guidelines.append("Follow the length sequence above")
+    if bot_count > 2:
+        guidelines.append(
+            f"EVERY speaker MUST have at least one "
+            f"message â€” do NOT skip any participant"
+        )
+    if is_rp:
+        guidelines.append(
+            "Each speaker stays in character for their "
+            "race and class"
+        )
+        guidelines.append(
+            "No game terms, abbreviations, or OOC references"
+        )
+        guidelines.append(
+            "VARY message lengths naturally - some brief, "
+            "some more expressive"
+        )
+    else:
+        guidelines.append(
+            "VARY message lengths naturally "
+            "- some short, some medium, some longer"
+        )
+    if zone_mobs:
+        guidelines.append(
+            "Only mention creatures from the provided list "
+            "- do NOT invent creatures"
+        )
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages,
+        allow_same_subject=bool(
+            thread_turn and thread_turn.builds_on_subject
+        ),
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    if thread_turn is not None:
+        return append_conversation_json_instruction(
+            prompt, bot_names, msg_count, allow_action,
+            trailing_object=THREAD_REPORT_OBJECT,
+            include_thread=True,
+            thread_speaker_names=bot_names,
+            extra_rule=THREAD_REPORT_RULE,
+        )
+    return append_conversation_json_instruction(
+        prompt, bot_names, msg_count, allow_action
+    )
+
+
+def _format_gossip_target(target: dict, target_type: str) -> str:
+    """Build a compact target description for gossip prompts."""
+    if target_type == 'npc':
+        details = [
+            f"name={target.get('name', 'Unknown NPC')}",
+            f"function={target.get('function', 'local NPC')}",
+        ]
+        if target.get('subname'):
+            details.append(f"title={target['subname']}")
+        if target.get('kind'):
+            details.append(f"kind={target['kind']}")
+        if target.get('combat_class'):
+            details.append(
+                f"combat style={target['combat_class']}"
+            )
+        min_level = int(target.get('minlevel') or 0)
+        max_level = int(target.get('maxlevel') or 0)
+        if min_level or max_level:
+            if min_level == max_level:
+                details.append(f"level={min_level}")
+            else:
+                details.append(
+                    f"level range={min_level}-{max_level}"
+                )
+        return "; ".join(details)
+
+    return "; ".join([
+        f"name={target.get('name', 'Unknown bot')}",
+        f"race={target.get('race', 'Unknown')}",
+        f"class={target.get('class', 'Adventurer')}",
+        f"level={target.get('level', '?')}",
+    ])
+
+
+def _append_gossip_context(
+    parts: list,
+    zone_id: int,
+    area_id: int,
+    current_weather: str,
+    target: dict,
+    target_type: str,
+    is_rp: bool,
+) -> None:
+    """Append shared local and target context for gossip prompts."""
+    zone_flavor = get_zone_flavor(zone_id)
+    if is_rp and zone_flavor:
+        parts.append(f"Zone context: {zone_flavor}")
+
+    subzone_lore = get_subzone_lore(zone_id, area_id)
+    if is_rp and subzone_lore:
+        parts.append(f"Current subzone: {subzone_lore}")
+    else:
+        subzone_name = get_subzone_name(zone_id, area_id)
+        if subzone_name:
+            parts.append(f"Subzone: {subzone_name}")
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    label = 'NPC' if target_type == 'npc' else 'bot'
+    parts.append(
+        f"Gossip subject ({label}): "
+        f"{_format_gossip_target(target, target_type)}"
+    )
+    parts.append(
+        "The subject is someone people could plausibly talk "
+        "about, not someone being addressed directly."
+    )
+
+
+def build_gossip_statement_prompt(
+    bot: dict,
+    target: dict,
+    target_type: str,
+    zone_id: int,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    area_id: int = 0,
+    length_hint: str = "",
+) -> str:
+    """Build a General-channel gossip statement prompt."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    parts = []
+
+    if is_rp:
+        identity = build_bot_identity(
+            bot['name'], bot.get('race', ''),
+            bot.get('class', ''), bot.get('gender', ''),
+            gear=bot.get('gear', ''),
+        )
+        parts.append(
+            f"{identity} Speak in-character in General "
+            f"chat in {bot['zone']}."
+        )
+        rp_ctx = build_race_class_context(
+            bot.get('race', ''), bot.get('class', '')
+        )
+        if rp_ctx:
+            parts.append(rp_ctx)
+    else:
+        parts.append(
+            f"Generate a brief WoW General chat message "
+            f"from a player in {bot['zone']}."
+        )
+
+    _append_gossip_context(
+        parts, zone_id, area_id, current_weather,
+        target, target_type, is_rp,
+    )
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    parts.append(
+        build_persona_block(persona_for_bot(bot, mode), mode)
+    )
+
+    twist = maybe_get_gossip_creative_twist(mode=mode)
+    if twist:
+        parts.append(f"{TWIST_LABEL}: {twist}")
+
+    target_label = 'NPC' if target_type == 'npc' else 'bot'
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode,
+        length_hint=length_hint,
+    )
+    guidelines.extend([
+        f"Gossip about the {target_label}; do not speak "
+        f"as the {target_label}",
+        "Do not address the gossip subject directly",
+        "Use the subject's exact name if it sounds natural",
+        "No brackets around names",
+    ])
+    if is_rp:
+        guidelines.append(
+            "Stay in character but sound natural, not theatrical"
+        )
+    else:
+        guidelines.append(
+            "Speak as a player discussing the game, not as "
+            "the character roleplaying"
+        )
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(recent_messages)
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_json_instruction(
+        prompt, allow_action, skip_emote=True
+    )
+
+
+def build_gossip_conversation_prompt(
+    bots: List[dict],
+    target: dict,
+    target_type: str,
+    zone_id: int,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    area_id: int = 0,
+) -> str:
+    """Build a General-channel gossip conversation prompt."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    parts = []
+    bot_count = len(bots)
+    bot_names = [b['name'] for b in bots]
+
+    if is_rp:
+        parts.append(
+            f"Generate an in-character General chat exchange "
+            f"between {bot_count} adventurers in "
+            f"{bots[0]['zone']}."
+        )
+    else:
+        parts.append(
+            f"Generate a casual General chat exchange between "
+            f"{bot_count} WoW players in {bots[0]['zone']}."
+        )
+
+    _append_gossip_context(
+        parts, zone_id, area_id, current_weather,
+        target, target_type, is_rp,
+    )
+
+    parts.append(f"Speakers: {', '.join(bot_names)}")
+
+    seen_races = set()
+    seen_classes = set()
+    for bot in bots:
+        if is_rp or random.random() < 0.4:
+            race = bot.get('race', '')
+            cls = bot.get('class', '')
+            parts.append(f"{bot['name']} is a {race} {cls}")
+            append_speaker_gear(parts, bot)
+            if is_rp:
+                per_bot, shared_race, shared_class = (
+                    build_race_class_context_parts(race, cls)
+                )
+                if per_bot:
+                    parts.append(f"  {per_bot}")
+                if race not in seen_races and shared_race:
+                    parts.append(f"  {shared_race}")
+                    seen_races.add(race)
+                if cls not in seen_classes and shared_class:
+                    parts.append(f"  {shared_class}")
+                    seen_classes.add(cls)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    parts.extend(build_cast_lines(
+        [persona_for_bot(b, mode) for b in bots], mode
+    ))
+
+    twist = maybe_get_gossip_creative_twist(mode=mode)
+    if twist:
+        parts.append(
+            f"{TWIST_LABEL_CONVERSATION}: {twist}"
+        )
+
+    msg_count = select_conversation_message_count(
+        bot_count, bot_count, bot_count + 3
+    )
+    length_sequence = generate_conversation_length_sequence(
+        msg_count
+    )
+    parts.append(
+        "\nLENGTH SEQUENCE "
+        "(follow this for each message):"
+    )
+    for i, length in enumerate(length_sequence):
+        speaker = bot_names[i % bot_count]
+        parts.append(
+            f"  Message {i+1} ({speaker}): "
+            f"length={length}"
+        )
+
+    target_label = 'NPC' if target_type == 'npc' else 'bot'
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.extend([
+        f"The conversation is gossip about the {target_label}",
+        f"Do not make the {target_label} a speaker",
+        "Do not address the gossip subject directly",
+        "Use the subject's exact name if it sounds natural",
+        "Follow the length sequence above",
+    ])
+    if bot_count > 2:
+        guidelines.append(
+            f"EVERY speaker MUST have at least one message "
+            f"- do NOT skip any participant"
+        )
+    if is_rp:
+        guidelines.append(
+            "Each speaker stays in character for their "
+            "race and class"
+        )
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(recent_messages)
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_conversation_json_instruction(
+        prompt, bot_names, msg_count, allow_action
+    )
+
+
+def build_quest_conversation_prompt(
+    bots: List[dict],
+    quest: dict,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    zone_id: int = 0,
+) -> str:
+    """Build a prompt for a quest conversation with 2-4 bots."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    parts = []
+    bot_count = len(bots)
+    bot_names = [b['name'] for b in bots]
+
+    if is_rp:
+        parts.append(
+            f"Generate an in-character General chat exchange "
+            f"about a quest in {bots[0]['zone']}. Each speaker "
+            f"stays true to their race and class."
+        )
+    else:
+        parts.append(
+            f"Generate a casual General chat exchange about "
+            f"a quest in {bots[0]['zone']}."
+        )
+    parts.append(f"Speakers: {', '.join(bot_names)}")
+    parts.append(
+        "Names: Sometimes use their name when addressing "
+        "directly (maybe 1-2 times), but not every message."
+    )
+
+    if is_rp:
+        for bot in bots:
+            parts.append(
+                f"{bot['name']} is a "
+                f"{bot['race']} {bot['class']}"
+            )
+            append_speaker_gear(parts, bot)
+
+    zone_flavor = get_zone_flavor(zone_id)
+    if is_rp and zone_flavor:
+        parts.append(f"Zone context: {zone_flavor}")
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    parts.append(
+        f"Quest: {quest['quest_name']} "
+        f"(use {{quest:{quest['quest_name']}}} placeholder)"
+    )
+    if quest.get('description') and random.random() < 0.4:
+        parts.append(
+            f"Quest involves: {quest['description'][:60]}"
+        )
+
+    parts.extend(build_cast_lines(
+        [persona_for_bot(b, mode) for b in bots], mode
+    ))
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(
+            f"{TWIST_LABEL_CONVERSATION}: {twist}"
+        )
+
+    min_msgs = bot_count
+    max_msgs = bot_count + 3
+    msg_count = select_conversation_message_count(
+        bot_count, min_msgs, max_msgs
+    )
+    length_sequence = generate_conversation_length_sequence(
+        msg_count
+    )
+
+    parts.append(
+        "\nLENGTH SEQUENCE "
+        "(follow this for each message):"
+    )
+    for i, length in enumerate(length_sequence):
+        speaker = bot_names[i % bot_count]
+        parts.append(
+            f"  Message {i+1} ({speaker}): "
+            f"length={length}"
+        )
+
+    if is_rp:
+        angles = [
+            "seeking allies for a perilous task",
+            "debating the best approach to the objective",
+            "sharing knowledge of the quest's history",
+            "steeling each other for the dangers ahead",
+        ]
+    else:
+        angles = [
+            "asking for help with the quest",
+            "sharing where to find objectives",
+            "complaining about quest difficulty",
+            "discussing rewards",
+            "warning about dangers",
+            "celebrating completion",
+        ]
+    if random.random() < 0.5:
+        parts.append(
+            f"Angle hint: {random.choice(angles)}"
+        )
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append("Use quest placeholder at least once")
+    guidelines.append("Follow the length sequence above")
+    if bot_count > 2:
+        guidelines.append(
+            f"EVERY speaker MUST have at least one "
+            f"message â€” do NOT skip any participant"
+        )
+    guidelines.append(
+        "STRICT: Each message MUST be under 120 "
+        "characters. Short is better"
+    )
+    if is_rp:
+        guidelines.append(
+            "Each speaker stays in character for their "
+            "race and class"
+        )
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_conversation_json_instruction(
+        prompt, bot_names, msg_count, allow_action
+    )
+
+
+def build_event_conversation_prompt(
+    bots: List[dict],
+    event_context: str,
+    zone_id: int = 0,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    area_id: int = 0,
+) -> str:
+    """Build a prompt for an event-triggered conversation."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    parts = []
+    bot_count = len(bots)
+    bot_names = [b['name'] for b in bots]
+
+    if is_rp:
+        parts.append(
+            f"Generate an in-character General chat exchange "
+            f"between {bot_count} adventurers in "
+            f"{bots[0]['zone']}."
+        )
+    else:
+        parts.append(
+            f"Generate a casual General chat exchange between "
+            f"{bot_count} WoW players in {bots[0]['zone']}. "
+            f"They speak as players discussing the game, not "
+            f"roleplaying their characters."
+        )
+    parts.append(f"Speakers: {', '.join(bot_names)}")
+    parts.append(
+        "Names: Sometimes use their name when addressing "
+        "directly (maybe once), but not every message."
+    )
+
+    parts.append(f"\nEVENT CONTEXT: {event_context}")
+
+    # Zone flavor and subzone context
+    if is_rp and zone_id:
+        zone_flav = get_zone_flavor(zone_id)
+        if zone_flav:
+            parts.append(
+                f"Zone context: {zone_flav}"
+            )
+        subzone_lore = get_subzone_lore(
+            zone_id, area_id
+        )
+        if subzone_lore:
+            parts.append(
+                f"Current subzone: {subzone_lore}"
+            )
+        else:
+            subzone_name = get_subzone_name(
+                zone_id, area_id
+            )
+            if subzone_name:
+                parts.append(
+                    f"Subzone: {subzone_name}"
+                )
+
+    is_transport = (
+        'boat' in event_context.lower()
+        or 'zeppelin' in event_context.lower()
+        or 'turtle' in event_context.lower()
+    )
+    is_holiday = (
+        'event has just begun' in event_context.lower()
+        or 'event is coming to an end'
+        in event_context.lower()
+    )
+    if is_transport:
+        parts.append(
+            "This transport just arrived - at least one bot "
+            "should comment on it!"
+        )
+        parts.append(
+            "Use the specific transport type "
+            "(boat/zeppelin/turtle), NOT the generic word "
+            "'transport'."
+        )
+        parts.append(
+            "CRITICAL: Read the event context carefully - "
+            "it tells you WHERE the transport arrived (your "
+            "current location) and WHERE it came FROM."
+        )
+        parts.append(
+            "If bots want to board or leave, they go TO the "
+            "origin (where it came from), NOT to their "
+            "current location!"
+        )
+        parts.append(
+            "If a ship name is mentioned (e.g., 'The "
+            "Moonspray'), you can optionally include it."
+        )
+    elif is_holiday:
+        parts.append(
+            "This conversation should be ABOUT the "
+            "event! Each bot shares their opinion or "
+            "feelings about it - excited, annoyed, "
+            "nostalgic, indifferent, etc. "
+            "Mention the event by name."
+        )
+    else:
+        parts.append(
+            "The conversation may naturally reference this "
+            "event, or players may chat about something else."
+        )
+        parts.append(
+            "The event provides atmosphere - you don't HAVE "
+            "to mention it explicitly."
+        )
+
+    weather_for_context = (
+        current_weather
+        if 'weather' not in event_context.lower()
+        else None
+    )
+    append_environmental_context(parts, weather_for_context)
+
+    # Precompute shared race context once per unique race.
+    # Pass race_count so lore uses cumulative probability
+    # 1-(1-p)^n, preserving pre-dedup lore frequency.
+    shared_race_cache = {}
+    if is_rp:
+        race_counts = {}
+        for bot in bots:
+            r = bot.get('race', '')
+            if r:
+                race_counts[r] = race_counts.get(r, 0) + 1
+        for race, count in race_counts.items():
+            _, sr, _ = build_race_class_context_parts(
+                race, '', race_count=count
+            )
+            shared_race_cache[race] = sr
+
+    seen_races = set()
+    seen_classes = set()
+    for bot in bots:
+        if is_rp or random.random() < 0.4:
+            race = bot.get('race', '')
+            cls = bot.get('class', '')
+            parts.append(
+                f"{bot['name']} is a {race} {cls}"
+            )
+            append_speaker_gear(parts, bot)
+            if is_rp:
+                per_bot, _, shared_class = (
+                    build_race_class_context_parts(
+                        race, cls
+                    )
+                )
+                if per_bot:
+                    parts.append(f"  {per_bot}")
+                if race not in seen_races:
+                    sr = shared_race_cache.get(
+                        race, ''
+                    )
+                    if sr:
+                        parts.append(
+                            f"  {sr}"
+                        )
+                    seen_races.add(race)
+                if cls not in seen_classes:
+                    if shared_class:
+                        parts.append(
+                            f"  {shared_class}"
+                        )
+                    seen_classes.add(cls)
+
+    parts.extend(build_cast_lines(
+        [persona_for_bot(b, mode) for b in bots], mode
+    ))
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(
+            f"{TWIST_LABEL_CONVERSATION}: {twist}"
+        )
+
+    min_msgs = bot_count
+    max_msgs = bot_count + 2
+    msg_count = select_conversation_message_count(
+        bot_count, min_msgs, max_msgs
+    )
+    length_sequence = generate_conversation_length_sequence(
+        msg_count
+    )
+
+    parts.append(
+        "\nLENGTH SEQUENCE "
+        "(follow this for each message):"
+    )
+    for i, length in enumerate(length_sequence):
+        speaker = bot_names[i % bot_count]
+        parts.append(
+            f"  Message {i+1} ({speaker}): "
+            f"length={length}"
+        )
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append("Follow the length sequence above")
+    if bot_count > 2:
+        guidelines.append(
+            f"EVERY speaker MUST have at least one "
+            f"message â€” do NOT skip any participant"
+        )
+    if is_rp:
+        guidelines.append(
+            "Each speaker stays in character for their "
+            "race and class"
+        )
+        guidelines.append(
+            "VARY message lengths naturally - some brief, "
+            "some more expressive"
+        )
+    else:
+        guidelines.append(
+            "VARY message lengths naturally - some very "
+            "short ('lol', 'yeah'), some medium, "
+            "occasionally longer"
+        )
+    parts.append("Guidelines: " + "; ".join(guidelines))
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_conversation_json_instruction(
+        prompt, bot_names, msg_count, allow_action
+    )
+
+
+def build_event_statement_prompt(
+    bot: dict,
+    event_context: str,
+    event_type: str = '',
+    zone_name: str = 'the world',
+    config: dict = None,
+    extra_data: dict = None,
+    allow_action: bool = True,
+    zone_id: int = 0,
+    area_id: int = 0,
+) -> str:
+    """Build a prompt for an event-triggered statement."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    persona = bot.get('persona') or persona_from_fields(
+        bot.get('bot1_name', ''), mode,
+        bot.get('bot1_guid', 0),
+    )
+    extra_data = extra_data or {}
+
+    is_transport = (
+        'boat' in event_context.lower()
+        or 'zeppelin' in event_context.lower()
+        or 'turtle' in event_context.lower()
+    )
+    is_holiday = event_type.startswith('holiday')
+    if is_transport:
+        event_instruction = (
+            "Comment on this transport "
+            "arrival! Use the specific "
+            "type (boat/zeppelin/"
+            "turtle), NOT 'transport'."
+            "\nMention the destination "
+            "if known. Be creative and "
+            "original - no canned "
+            "phrases."
+        )
+    elif is_holiday:
+        if is_rp:
+            event_instruction = (
+                "React to this event, mention it by name, and share your "
+                "character's opinion or feelings about it."
+            )
+        else:
+            event_instruction = (
+                "React as a player, mention the event by name, and share a "
+                "natural opinion about the gameplay event."
+            )
+    else:
+        event_instruction = (
+            "You may naturally reference"
+            " this event in your "
+            "message, or you may chat "
+            "about something else "
+            "entirely.\nThe event "
+            "provides atmosphere - you "
+            "don't HAVE to mention it "
+            "explicitly."
+        )
+
+    weather_for_context = None
+    if 'weather' not in event_context.lower():
+        weather_for_context = extra_data.get(
+            'current_weather'
+        ) or None
+
+    env_lines = ""
+    if is_rp:
+        env_lines = "".join(
+            f"\n{line}" for line
+            in build_environmental_context_lines(
+                weather_for_context
+            )
+        )
+
+    rp_personality = ""
+    rp_style = ""
+    if is_rp:
+        rp_ctx = build_race_class_context(
+            bot['bot1_race'],
+            bot['bot1_class']
+        )
+        if rp_ctx:
+            rp_personality = f"\n{rp_ctx}"
+        rp_style = (
+            "\nStay in character but "
+            "keep it natural and "
+            "conversational. No game "
+            "terms or OOC references, "
+            "but don't be overly "
+            "dramatic or theatrical "
+            "either."
+        )
+
+    # Zone flavor and subzone context
+    zone_context = ""
+    if is_rp and zone_id:
+        zone_flav = get_zone_flavor(zone_id)
+        if zone_flav:
+            zone_context += (
+                f"\nZone context: {zone_flav}"
+            )
+        subzone_lore = get_subzone_lore(
+            zone_id, area_id
+        )
+        if subzone_lore:
+            zone_context += (
+                f"\nCurrent subzone: "
+                f"{subzone_lore}"
+            )
+        else:
+            subzone_name = get_subzone_name(
+                zone_id, area_id
+            )
+            if subzone_name:
+                zone_context += (
+                    f"\nSubzone: {subzone_name}"
+                )
+
+    identity = build_player_prompt_header(
+        bot['bot1_name'],
+        bot['bot1_race'],
+        bot['bot1_class'],
+        bot['bot1_level'],
+        mode=mode,
+        channel='general',
+    )
+    location_line = (
+        f"You are currently in {zone_name}."
+        if is_rp
+        else f"Your character is currently in {zone_name}."
+    )
+    prompt = (
+        f"{identity}\n"
+        f"{location_line}"
+        f"{env_lines}"
+        f"{zone_context}"
+        f"{rp_personality}\n\n"
+        f"CONTEXT: {event_context}\n\n"
+        f"{event_instruction}\n\n"
+        f"{build_persona_block(persona, mode)}"
+        f"{rp_style}\n\n"
+        f"Respond with a single short "
+        f"sentence (under 100 "
+        f"characters) that a player "
+        f"might say in General chat.\n"
+        f"Be "
+        f"{'authentic and in-character' if is_rp else 'casual and authentic'}"
+        f"."
+    )
+    return append_json_instruction(
+        prompt, allow_action, skip_emote=True
+    )
+
+
+# =============================================================================
+# SPELL PROMPTS
+# =============================================================================
+def build_spell_statement_prompt(
+    bot: dict,
+    spell: dict,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    zone_id: int = 0,
+) -> str:
+    """Build a prompt for a spell/ability statement."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    parts = []
+
+    spell_placeholder = (
+        f"{{spell:{spell['spell_name']}}}"
+    )
+
+    if is_rp:
+        identity = build_bot_identity(
+            bot['name'],
+            bot.get('race', ''),
+            bot.get('class', ''),
+            bot.get('gender', ''),
+            gear=bot.get('gear', ''),
+        )
+        parts.append(
+            f"{identity} "
+            f"Speak in-character about a spell "
+            f"or ability you know."
+        )
+        rp_ctx = build_race_class_context(
+            bot.get('race', ''),
+            bot.get('class', '')
+        )
+        if rp_ctx:
+            parts.append(rp_ctx)
+    else:
+        parts.append(
+            "Generate a brief WoW General chat "
+            "message about a class spell or ability."
+        )
+        parts.append(f"Zone: {bot['zone']}")
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    if random.random() < 0.5:
+        parts.append(f"Player level: {bot['level']}")
+    parts.append(f"Player class: {bot['class']}")
+
+    parts.append(
+        f"Spell: {spell['spell_name']}"
+    )
+    if spell.get('spell_desc'):
+        parts.append(
+            f"What it does: {spell['spell_desc']}"
+        )
+    parts.append(
+        f"REQUIRED: Include exactly "
+        f"{spell_placeholder} in your message "
+        f"(this becomes a clickable spell link)"
+    )
+
+    parts.append(
+        build_persona_block(persona_for_bot(bot, mode), mode)
+    )
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(f"{TWIST_LABEL}: {twist}")
+
+    if is_rp:
+        approaches = [
+            "talking about mastering the ability",
+            "saying how the new power feels",
+            "mentioning your training experience",
+            "comparing it to another technique",
+            "wondering about what comes next",
+        ]
+    else:
+        approaches = [
+            "just trained it, excited",
+            "asking if it's worth the gold",
+            "comparing to another ability",
+            "complaining about the spell",
+            "bragging about damage/healing",
+            "asking for tips on using it",
+            "discussing spec or talent build",
+        ]
+    if random.random() < 0.6:
+        parts.append(
+            f"Approach: {random.choice(approaches)}"
+        )
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append(
+        "STRICT: Keep under 80 characters "
+        "(the link counts as ~15 chars)"
+    )
+    if is_rp:
+        guidelines.append(
+            "Stay in character but sound natural, "
+            "not theatrical"
+        )
+    guidelines.append(
+        "Be creative and unpredictable"
+    )
+    parts.append(
+        "Guidelines: " + "; ".join(guidelines)
+    )
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_json_instruction(
+        prompt, allow_action, skip_emote=True
+    )
+
+
+def build_spell_conversation_prompt(
+    bots: List[dict],
+    spell: dict,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    zone_id: int = 0,
+) -> str:
+    """Build a prompt for a spell conversation
+    with 2-4 bots discussing an ability."""
+    mode = (
+        get_chatter_mode(config)
+        if config else 'normal'
+    )
+    is_rp = (mode == 'roleplay')
+    parts = []
+    bot_count = len(bots)
+    bot_names = [b['name'] for b in bots]
+
+    spell_placeholder = (
+        f"{{spell:{spell['spell_name']}}}"
+    )
+
+    if is_rp:
+        parts.append(
+            f"Generate an in-character General "
+            f"chat exchange about an ability "
+            f"in {bots[0]['zone']}."
+        )
+    else:
+        parts.append(
+            f"Generate a casual General chat "
+            f"exchange where players discuss a "
+            f"class ability in {bots[0]['zone']}."
+        )
+
+    parts.append(
+        f"Speakers: {', '.join(bot_names)}"
+    )
+    parts.append(
+        "Names: Sometimes use their name when "
+        "addressing directly (maybe once), but "
+        "not every message."
+    )
+    parts.append(
+        f"The first speaker ({bot_names[0]}) is a "
+        f"{bots[0]['class']} who knows this spell."
+    )
+
+    # Precompute shared race context once per unique
+    # race to avoid duplicating worldview/lore.
+    shared_race_cache = {}
+    if is_rp:
+        race_counts = {}
+        for bot in bots:
+            r = bot.get('race', '')
+            if r:
+                race_counts[r] = (
+                    race_counts.get(r, 0) + 1
+                )
+        for race, count in race_counts.items():
+            _, sr, _ = build_race_class_context_parts(
+                race, '', race_count=count
+            )
+            shared_race_cache[race] = sr
+
+    seen_races = set()
+    seen_classes = set()
+    for bot in bots:
+        parts.append(
+            f"{bot['name']} is a "
+            f"{bot['race']} {bot['class']}"
+        )
+        append_speaker_gear(parts, bot)
+        if is_rp:
+            race = bot.get('race', '')
+            cls = bot.get('class', '')
+            per_bot, _, shared_class = (
+                build_race_class_context_parts(
+                    race, cls
+                )
+            )
+            if per_bot:
+                parts.append(f"  {per_bot}")
+            if race not in seen_races:
+                sr = shared_race_cache.get(race, '')
+                if sr:
+                    parts.append(f"  {sr}")
+                seen_races.add(race)
+            resolved_role = (
+                CLASS_ROLE_MAP.get(cls) or ''
+            )
+            cls_role_key = (cls, resolved_role)
+            if cls_role_key not in seen_classes:
+                if shared_class:
+                    parts.append(f"  {shared_class}")
+                seen_classes.add(cls_role_key)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    parts.append(
+        f"Spell being discussed: "
+        f"{spell['spell_name']} "
+        f"({bots[0]['class']} ability)"
+    )
+    if spell.get('spell_desc'):
+        parts.append(
+            f"What it does: {spell['spell_desc']}"
+        )
+    parts.append(
+        f"REQUIRED: Use {spell_placeholder} in the "
+        f"\"message\" field (NOT in the action). "
+        f"This becomes a clickable link"
+    )
+    parts.append(
+        "Other speakers may mention their own "
+        "class abilities by name (plain text, no "
+        "placeholder) for comparison."
+    )
+
+    parts.extend(build_cast_lines(
+        [persona_for_bot(b, mode) for b in bots], mode
+    ))
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(
+            f"{TWIST_LABEL_CONVERSATION}: "
+            f"{twist}"
+        )
+
+    min_msgs = bot_count
+    max_msgs = bot_count + 2
+    msg_count = select_conversation_message_count(
+        bot_count, min_msgs, max_msgs
+    )
+    length_sequence = (
+        generate_conversation_length_sequence(
+            msg_count
+        )
+    )
+
+    parts.append(
+        "\nLENGTH SEQUENCE "
+        "(follow this for each message):"
+    )
+    for i, length in enumerate(length_sequence):
+        speaker = bot_names[i % bot_count]
+        parts.append(
+            f"  Message {i+1} ({speaker}): "
+            f"length={length}"
+        )
+
+    if is_rp:
+        angles = [
+            "comparing techniques and training "
+            "methods",
+            "one demonstrates while others "
+            "react",
+            "debating which abilities are most "
+            "vital",
+            "sharing stories of the spell in "
+            "battle",
+        ]
+    else:
+        angles = [
+            "one just learned it and others "
+            "react with jealousy or advice",
+            "debating if the spell is overpowered "
+            "or underpowered",
+            "comparing to similar abilities in "
+            "other classes",
+            "tips on when and how to use it "
+            "effectively",
+            "discussing talent builds that "
+            "improve the spell",
+        ]
+    parts.append(f"Angle: {random.choice(angles)}")
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append(
+        "Use spell placeholder at least once"
+    )
+    guidelines.append(
+        "Follow the length sequence above"
+    )
+    if bot_count > 2:
+        guidelines.append(
+            f"EVERY speaker MUST have at least one "
+            f"message â€” do NOT skip any participant"
+        )
+    guidelines.append(
+        "STRICT: Each message MUST be under 120 "
+        "characters. Short is better"
+    )
+    if is_rp:
+        guidelines.append(
+            "Each speaker stays in character for "
+            "their race and class"
+        )
+    parts.append(
+        "Guidelines: " + "; ".join(guidelines)
+    )
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_conversation_json_instruction(
+        prompt, bot_names, msg_count, allow_action
+    )
+
+
+# =============================================================================
+# TRADE / SELL PROMPTS
+# =============================================================================
+def build_trade_statement_prompt(
+    bot: dict,
+    item: dict,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    zone_id: int = 0,
+) -> str:
+    """Build a prompt for a trade/sell statement."""
+    mode = get_chatter_mode(config) if config else 'normal'
+    is_rp = (mode == 'roleplay')
+    quality_names = {
+        0: "poor", 1: "common", 2: "uncommon",
+        3: "rare", 4: "epic", 5: "legendary",
+        6: "artifact", 7: "heirloom",
+    }
+    quality = quality_names.get(
+        item.get('item_quality', 2), "uncommon"
+    )
+
+    parts = []
+    item_placeholder = (
+        f"{{item:{item['item_name']}}}"
+    )
+
+    if is_rp:
+        identity = build_bot_identity(
+            bot['name'],
+            bot.get('race', ''),
+            bot.get('class', ''),
+            bot.get('gender', ''),
+            gear=bot.get('gear', ''),
+        )
+        parts.append(
+            f"{identity} You want to "
+            f"sell or trade an item you found. "
+            f"Speak in-character."
+        )
+        rp_ctx = build_race_class_context(
+            bot.get('race', ''), bot.get('class', '')
+        )
+        if rp_ctx:
+            parts.append(rp_ctx)
+    else:
+        parts.append(
+            "Generate a WoW General chat message "
+            "where a player is selling or looking "
+            "to trade an item."
+        )
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    parts.append(
+        f"Item: {item['item_name']} ({quality} "
+        f"quality)"
+    )
+    item_count = max(1, int(item.get('item_count', 1)))
+    parts.append(
+        f"Inventory truth: {bot['name']} currently owns "
+        f"{item_count} of this item and must not offer "
+        "more than that quantity"
+    )
+    vendor_price = format_price(
+        item.get('sell_price', 0)
+    )
+    if vendor_price:
+        # Player prices ~2-5x vendor for whites,
+        # more for greens/blues
+        parts.append(
+            f"Vendor sell price: {vendor_price} "
+            f"(player price should be higher, "
+            f"roughly 2-5x vendor value)"
+        )
+    parts.append(
+        f"REQUIRED: Include exactly "
+        f"{item_placeholder} in the \"message\" "
+        f"JSON field (NOT in the action). "
+        f"This becomes a clickable link"
+    )
+
+    parts.append(
+        build_persona_block(persona_for_bot(bot, mode), mode)
+    )
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(f"{TWIST_LABEL}: {twist}")
+
+    if is_rp:
+        styles = [
+            "announcing you have something to sell",
+            "looking for a fair trade",
+            "mentioning you've outgrown this gear",
+            "offering your find to anyone interested",
+        ]
+    else:
+        styles = [
+            "WTS style - short trade post with "
+            "price",
+            "casual offer - mentioning you don't "
+            "need it",
+            "asking if anyone needs the item",
+            "advertising the item with enthusiasm",
+            "lowkey mention you're selling cheap",
+            "LF buyer, taking offers",
+        ]
+    parts.append(f"Style: {random.choice(styles)}")
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append(
+        "STRICT: Keep under 80 characters "
+        "(the link counts as ~15 chars)"
+    )
+    guidelines.append(
+        "Include a realistic price in gold/silver "
+        "(e.g. 2g, 50s, 1g20s)"
+    )
+    guidelines.append(
+        "Trade abbreviations encouraged: WTS, WTB, "
+        "WTT, pst, /w, OBO"
+    )
+    if is_rp:
+        guidelines.append(
+            "Stay in character but sound natural"
+        )
+    parts.append(
+        "Guidelines: " + "; ".join(guidelines)
+    )
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_json_instruction(
+        prompt, allow_action, skip_emote=True
+    )
+
+
+def build_trade_conversation_prompt(
+    bots: List[dict],
+    item: dict,
+    config: dict = None,
+    current_weather: str = None,
+    recent_messages: list = None,
+    allow_action: bool = True,
+    speaker_talent_context=None,
+    zone_id: int = 0,
+) -> str:
+    """Build a prompt for a trade conversation
+    with 2-4 bots haggling over an item."""
+    mode = (
+        get_chatter_mode(config)
+        if config else 'normal'
+    )
+    is_rp = (mode == 'roleplay')
+    parts = []
+    bot_count = len(bots)
+    bot_names = [b['name'] for b in bots]
+
+    quality_names = {
+        0: "poor", 1: "common", 2: "uncommon",
+        3: "rare", 4: "epic", 5: "legendary",
+        6: "artifact", 7: "heirloom",
+    }
+    quality = quality_names.get(
+        item.get('item_quality', 2), "uncommon"
+    )
+    item_placeholder = (
+        f"{{item:{item['item_name']}}}"
+    )
+
+    if is_rp:
+        parts.append(
+            f"Generate an in-character General "
+            f"chat exchange about trading/selling "
+            f"an item in {bots[0]['zone']}."
+        )
+    else:
+        parts.append(
+            f"Generate a casual General chat "
+            f"exchange where players haggle or "
+            f"discuss selling an item in "
+            f"{bots[0]['zone']}."
+        )
+
+    parts.append(
+        f"Speakers: {', '.join(bot_names)}"
+    )
+    parts.append(
+        "Names: Sometimes use their name when "
+        "addressing directly (maybe once), but "
+        "not every message."
+    )
+    parts.append(
+        f"The first speaker ({bot_names[0]}) is "
+        f"the seller and currently owns the item."
+    )
+
+    if is_rp:
+        for bot in bots:
+            parts.append(
+                f"{bot['name']} is a "
+                f"{bot['race']} {bot['class']}"
+            )
+            append_speaker_gear(parts, bot)
+
+    if speaker_talent_context:
+        parts.append(speaker_talent_context)
+
+    if is_rp:
+        append_environmental_context(parts, current_weather)
+
+    parts.append(
+        f"Item for sale: {item['item_name']} "
+        f"({quality} quality)"
+    )
+    item_count = max(1, int(item.get('item_count', 1)))
+    parts.append(
+        f"Inventory truth: {bot_names[0]} owns "
+        f"{item_count} of this item and nobody may "
+        "offer more than that quantity"
+    )
+    vendor_price = format_price(
+        item.get('sell_price', 0)
+    )
+    if vendor_price:
+        parts.append(
+            f"Vendor sell price: {vendor_price} "
+            f"(player price should be higher, "
+            f"roughly 2-5x vendor value)"
+        )
+    parts.append(
+        f"REQUIRED: Use {item_placeholder} in the "
+        f"\"message\" field (NOT in the action). "
+        f"This becomes a clickable link"
+    )
+
+    parts.extend(build_cast_lines(
+        [persona_for_bot(b, mode) for b in bots], mode
+    ))
+
+    twist = maybe_get_creative_twist(mode=mode)
+    if twist:
+        parts.append(
+            f"{TWIST_LABEL_CONVERSATION}: "
+            f"{twist}"
+        )
+
+    min_msgs = bot_count
+    max_msgs = bot_count + 2
+    msg_count = select_conversation_message_count(
+        bot_count, min_msgs, max_msgs
+    )
+    length_sequence = (
+        generate_conversation_length_sequence(
+            msg_count
+        )
+    )
+
+    parts.append(
+        "\nLENGTH SEQUENCE "
+        "(follow this for each message):"
+    )
+    for i, length in enumerate(length_sequence):
+        speaker = bot_names[i % bot_count]
+        parts.append(
+            f"  Message {i+1} ({speaker}): "
+            f"length={length}"
+        )
+
+    if is_rp:
+        angles = [
+            "bartering with in-character haggling",
+            "one offers an item and others "
+            "appraise its worth",
+            "negotiating a trade between "
+            "adventurers",
+            "debating a fair price with lore "
+            "flavor",
+        ]
+    else:
+        angles = [
+            "seller posts WTS, buyer haggles on "
+            "price",
+            "seller offers item, others comment "
+            "on whether it's worth it",
+            "back-and-forth negotiation with a "
+            "deal or walkaway",
+            "someone undercuts or offers a better "
+            "item",
+            "casual price check turning into a "
+            "sale",
+        ]
+    parts.append(f"Angle: {random.choice(angles)}")
+
+    guidelines = build_dynamic_guidelines(
+        config=config, mode=mode
+    )
+    guidelines.append(
+        "Use item placeholder at least once"
+    )
+    guidelines.append(
+        "Include realistic prices in gold/silver "
+        "(use vendor price as reference)"
+    )
+    guidelines.append(
+        "Trade abbreviations OK: WTS, WTB, WTT, "
+        "pst, OBO"
+    )
+    guidelines.append(
+        "Follow the length sequence above"
+    )
+    if bot_count > 2:
+        guidelines.append(
+            f"EVERY speaker MUST have at least one "
+            f"message â€” do NOT skip any participant"
+        )
+    guidelines.append(
+        "STRICT: Each message MUST be under 120 "
+        "characters. Short is better"
+    )
+    if is_rp:
+        guidelines.append(
+            "Each speaker stays in character for "
+            "their race and class"
+        )
+    parts.append(
+        "Guidelines: " + "; ".join(guidelines)
+    )
+
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        parts.append(anti_rep)
+
+    prompt = "\n".join(parts)
+    return append_conversation_json_instruction(
+        prompt, bot_names, msg_count, allow_action
+    )
+
+
+# =============================================================================
+# ZONE INTRUSION PROMPT
+# =============================================================================
+def build_zone_intrusion_prompt(
+    extra_data, config
+):
+    """Build prompt for zone intrusion yell.
+
+    The defender bot should yell an urgent warning
+    about the enemy intruder, flavored by their
+    race/class personality.
+    """
+    mode = get_chatter_mode(config)
+    is_rp = (mode == 'roleplay')
+
+    # Defender identity
+    defender_name = extra_data.get(
+        'defender_name', 'Unknown'
+    )
+    defender_class = CLASS_NAMES.get(
+        int(extra_data.get('defender_class', 0)),
+        'adventurer'
+    )
+    defender_race = RACE_NAMES.get(
+        int(extra_data.get('defender_race', 0)),
+        'Unknown'
+    )
+    defender_level = extra_data.get(
+        'defender_level', '??'
+    )
+
+    # Intruder identity
+    intruder_name = extra_data.get(
+        'intruder_name', 'Unknown'
+    )
+    intruder_class = CLASS_NAMES.get(
+        int(extra_data.get('intruder_class', 0)),
+        'adventurer'
+    )
+    intruder_race = RACE_NAMES.get(
+        int(extra_data.get('intruder_race', 0)),
+        'Unknown'
+    )
+    intruder_level = extra_data.get(
+        'intruder_level', '??'
+    )
+
+    zone_name = extra_data.get(
+        'zone_name', 'this area'
+    )
+    is_capital = extra_data.get(
+        'is_capital', False
+    )
+
+    # Race/class personality context
+    rc_context = ''
+    if is_rp:
+        rc_context = build_race_class_context(
+            defender_race, defender_class
+        )
+
+    capital_suffix = (
+        " -- your faction's capital city!"
+        if is_capital
+        else " -- your faction's territory!"
+    )
+
+    parts = []
+    parts.append(
+        build_player_prompt_header(
+            defender_name,
+            defender_race,
+            defender_class,
+            defender_level,
+            mode=mode,
+            channel='general',
+        )
+    )
+    if rc_context:
+        parts.append(rc_context)
+
+    parts.append(
+        f"\nSITUATION: An enemy {intruder_race} "
+        f"{intruder_class} named {intruder_name} "
+        f"(level {intruder_level}) has just been "
+        f"spotted in {zone_name}"
+        + capital_suffix
+    )
+
+    if is_rp:
+        parts.append(
+            "\nYell a brief in-character warning to nearby allies. Let "
+            "race, class, and personality shape the tone."
+        )
+    else:
+        parts.append(
+            "\nGive a brief, urgent player warning about the enemy in "
+            "zone chat. Use natural WoW PvP language without abuse."
+        )
+
+    parts.append(
+        "\nRules:"
+        "\n- Respond with ONLY the yell text"
+        "\n- No /slash commands"
+        "\n- No *emotes* or action text"
+        "\n- No quotation marks"
+        "\n- Do NOT use the word 'Hark'"
+        "\n- Keep it short and urgent"
+    )
+
+    # Plain-string prompt path — not routed through
+    # append_json_instruction, so inject the language
+    # rule directly.
+    from chatter_shared import get_language_rule
+    lang_rule = get_language_rule()
+    if lang_rule:
+        parts.append(lang_rule)
+
+    return '\n'.join(parts)

@@ -1,0 +1,1023 @@
+"""Screenshot Vision Agent — host-side capture and analysis.
+
+Runs on the Windows host (not in Docker). Periodically captures the
+WoW game window, sends it to a vision LLM for structured environmental
+analysis, and inserts the result into llm_chatter_events so the bridge
+can generate an in-character bot comment.
+
+Usage (from the AzerothCore workspace root):
+    python modules/mod-llm-chatter/tools/screenshot_agent.py --config env/dist/etc/modules/mod_llm_chatter.conf
+
+Requirements (host-side, using the same Python interpreter):
+    python -m pip install -r modules/mod-llm-chatter/tools/requirements.txt
+    python -m pip install mss Pillow pywin32
+"""
+
+import argparse
+import base64
+import ctypes
+import ctypes.wintypes
+import io
+import json
+import logging
+import random
+import re
+import sys
+import time
+
+import mysql.connector
+from PIL import Image
+
+from chatter_shared import parse_config
+from chatter_structured import (
+    ResponseContract, StructuredDependencyError, StructuredOutputError,
+    structured_output_enabled,
+)
+from chatter_llm import (
+    structured_completion, log_structured_failure, log_structured_target,
+    reset_structured_diagnostics, check_structured_dependencies,
+)
+from screenshot_proximity import request_ticket, publish_observation
+from llm_compat import (
+    build_chat_options,
+    create_chat_completion,
+    needs_reasoning_token_multiplier,
+    structured_rejection_category,
+)
+
+log = logging.getLogger("screenshot_agent")
+
+GOOGLE_OPENAI_BASE_URL = (
+    'https://generativelanguage.googleapis.com/v1beta/openai/'
+)
+OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1'
+
+# -----------------------------------------------------------
+# Vision prompt — Stage 1 (pure extraction, no personality)
+# -----------------------------------------------------------
+
+VISION_SYSTEM = (
+    "You are analyzing a World of Warcraft screenshot. "
+    "Look PAST all UI elements and text overlays — "
+    "focus ONLY on the 3D game world visible behind "
+    "them. Describe the environment, landscape, and "
+    "atmosphere — what the world itself looks like.\n\n"
+    "DESCRIBE (both outdoors AND indoors):\n"
+    "- Outdoor: terrain, vegetation, water bodies, "
+    "paths, bridges, ruins, towers, caves, banners\n"
+    "- Indoor: room layout, furniture, barrels, crates, "
+    "shelves, fireplaces, chandeliers, stairs, doorways, "
+    "windows, decorations, building materials\n"
+    "- Architecture: buildings, arches, columns, walls, "
+    "roofs, wooden beams, stone work, forges, altars\n"
+    "- Atmosphere: lighting, mood, color tones, shadows, "
+    "weather, fog, rain, snow, time of day\n"
+    "- Non-humanoid creatures ONLY: animals, beasts, "
+    "spiders, wolves, birds, undead monsters, demons, "
+    "elementals. Do NOT mention any humanoid figures\n\n"
+    "IGNORE (do not describe, but do NOT skip the scene "
+    "just because they are present):\n"
+    "- ALL humanoid figures — player characters, NPCs, "
+    "guards, vendors, other players, party members. "
+    "Humanoids do NOT make a scene uninteresting. "
+    "Describe the world around and behind them\n"
+    "- ALL UI elements: health bars, mana bars, action "
+    "bars, minimap, chat window, nameplates, buff/debuff "
+    "icons, tooltips, quest tracker, bag slots, menus\n"
+    "- ALL text on screen — chat messages, zone names, "
+    "quest text, NPC dialogue, damage numbers, floating "
+    "combat text, discovery banners, tooltips, item "
+    "names, player names, guild names. Do NOT read or "
+    "reference any text visible in the image\n"
+    "- Cursor or selection indicators\n\n"
+    "Return ONLY valid JSON with these fields:\n"
+    "{\n"
+    '  "landmark_type": "one of: castle, ruins, bridge, '
+    "tower, cave, waterfall, lake, river, camp, village, "
+    "city, ship, gate, statue, shrine, none\",\n"
+    '  "weather": "one of: clear, cloudy, foggy, rainy, '
+    "snowy, stormy, none\",\n"
+    '  "time_of_day": "one of: dawn, day, dusk, night, '
+    "unknown\",\n"
+    '  "biome": "one of: forest, tundra, desert, swamp, '
+    "mountain, coastal, plains, volcanic, underground, "
+    "urban, none\",\n"
+    '  "atmosphere": "brief mood/lighting description '
+    "or null\",\n"
+    '  "environment": "brief terrain/landmark description '
+    "or null\",\n"
+    '  "creatures": "brief NON-HUMANOID creature '
+    "description or null\",\n"
+    '  "skip_reason": "if ALL other fields are null, '
+    "explain why in a few words. Otherwise null\"\n"
+    "}\n"
+    "If the scene is a loading screen, character select, "
+    "or entirely obscured by UI, return all null/none.\n"
+    "Almost every scene has something worth describing: "
+    "architecture, interiors, lighting, vegetation, "
+    "weather, terrain. Ignore the humanoids but describe "
+    "the world behind and around them. Only return all "
+    "null/none if you truly cannot see any game world."
+)
+
+# -----------------------------------------------------------
+# Config parsing
+# -----------------------------------------------------------
+
+
+def load_screenshot_config(raw: dict) -> dict:
+    """Extract screenshot-specific config with defaults."""
+    return {
+        'structured_output': structured_output_enabled(raw),
+        'enable': raw.get(
+            'LLMChatter.Screenshot.Enable', '0') == '1',
+        'interval_min_seconds': int(raw.get(
+            'LLMChatter.Screenshot.IntervalMinSeconds',
+            '300')),
+        'interval_max_seconds': int(raw.get(
+            'LLMChatter.Screenshot.IntervalMaxSeconds',
+            '600')),
+        'chance': int(raw.get(
+            'LLMChatter.Screenshot.Chance', '30')),
+        'vision_provider': raw.get(
+            'LLMChatter.Screenshot.VisionProvider',
+            'openai').lower(),
+        'vision_model': raw.get(
+            'LLMChatter.Screenshot.VisionModel',
+            'gpt-6-luna'),
+        'bound_account_id': int(raw.get(
+            'LLMChatter.Screenshot.BoundAccountId', '0')),
+        'proximity_enable': raw.get(
+            'LLMChatter.Screenshot.Proximity.Enable', '0') == '1',
+        'proximity_chance': max(0, min(100, int(raw.get(
+            'LLMChatter.Screenshot.Proximity.Chance', '30')))),
+        'proximity_request_timeout': max(1, min(30, int(raw.get(
+            'LLMChatter.Screenshot.Proximity.RequestTimeoutSeconds', '5')))),
+        'max_width_px': int(raw.get(
+            'LLMChatter.Screenshot.MaxWidthPx', '640')),
+        'jpeg_quality': int(raw.get(
+            'LLMChatter.Screenshot.JpegQuality', '75')),
+        'anthropic_api_key': raw.get(
+            'LLMChatter.Anthropic.ApiKey', ''),
+        'openai_api_key': raw.get(
+            'LLMChatter.OpenAI.ApiKey', ''),
+        'openai_reasoning_effort': raw.get(
+            'LLMChatter.OpenAI.ReasoningEffort', ''),
+        'openai_max_tokens_multiplier': float(raw.get(
+            'LLMChatter.OpenAI.MaxTokensMultiplier', '4')),
+        'google_api_key': raw.get(
+            'LLMChatter.Google.ApiKey', ''),
+        'google_base_url': raw.get(
+            'LLMChatter.Google.BaseUrl',
+            GOOGLE_OPENAI_BASE_URL),
+        'openrouter_api_key': raw.get(
+            'LLMChatter.OpenRouter.ApiKey', ''),
+        'openrouter_base_url': raw.get(
+            'LLMChatter.OpenRouter.BaseUrl',
+            OPENROUTER_BASE_URL),
+        'openrouter_http_referer': raw.get(
+            'LLMChatter.OpenRouter.HttpReferer', ''),
+        'openrouter_title': raw.get(
+            'LLMChatter.OpenRouter.Title', ''),
+        # Host-side override: Database.Host is typically a
+        # Docker-internal hostname (e.g. ac-database) which
+        # the Windows host can't resolve. Screenshot.DBHost
+        # lets the agent use 127.0.0.1 without changing the
+        # shared bridge config.
+        'db_host': raw.get(
+            'LLMChatter.Screenshot.DBHost',
+            raw.get('LLMChatter.Database.Host',
+                    '127.0.0.1')),
+        'db_port': int(raw.get(
+            'LLMChatter.Database.Port', '3306')),
+        'db_user': raw.get(
+            'LLMChatter.Database.User', 'root'),
+        'db_pass': raw.get(
+            'LLMChatter.Database.Password', 'password'),
+        'db_name': raw.get(
+            'LLMChatter.Database.Name',
+            'acore_characters'),
+    }
+
+
+# -----------------------------------------------------------
+# Window capture
+# -----------------------------------------------------------
+
+
+def is_wow_foreground() -> bool:
+    """Check if WoW is the active foreground window."""
+    try:
+        import win32gui
+        hwnd = win32gui.GetForegroundWindow()
+        title = win32gui.GetWindowText(hwnd)
+        return "World of Warcraft" in title
+    except Exception:
+        return False
+
+
+def capture_wow_window() -> 'Image.Image | None':
+    """Capture the WoW game client area."""
+    try:
+        import mss
+        import win32gui
+        hwnd = win32gui.FindWindow(
+            None, "World of Warcraft")
+        if not hwnd:
+            return None
+
+        rect = win32gui.GetClientRect(hwnd)
+        point = ctypes.wintypes.POINT(0, 0)
+        ctypes.windll.user32.ClientToScreen(
+            hwnd, ctypes.byref(point))
+        left, top = point.x, point.y
+        width, height = rect[2], rect[3]
+        if width <= 0 or height <= 0:
+            return None
+        with mss.mss() as sct:
+            region = {
+                "left": left, "top": top,
+                "width": width, "height": height,
+            }
+            raw = sct.grab(region)
+            return Image.frombytes(
+                "RGB", raw.size, raw.bgra,
+                "raw", "BGRX")
+    except Exception as e:
+        log.warning("WoW window capture failed: %s", e)
+        return None
+
+
+# -----------------------------------------------------------
+# Image compression
+# -----------------------------------------------------------
+
+
+def crop_screenshot(img: 'Image.Image') -> 'Image.Image':
+    """Crop UI elements to isolate the 3D game world.
+    Keeps the top 2/3 of the viewport (above chat/action
+    bars) with party frames and minimap trimmed from the
+    sides."""
+    w, h = img.size
+    left = int(w * 0.12)
+    right = int(w * 0.88)
+    top = 0
+    bottom = int(h * 0.80)
+    return img.crop((left, top, right, bottom))
+
+
+def compress_screenshot(
+    img: 'Image.Image',
+    max_width: int = 640,
+    jpeg_quality: int = 75,
+) -> bytes:
+    """Resize and JPEG-compress screenshot for API upload."""
+    if img.width > max_width:
+        ratio = max_width / img.width
+        new_h = int(img.height * ratio)
+        img = img.resize(
+            (max_width, new_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(
+        buf, format="JPEG",
+        quality=jpeg_quality, optimize=True)
+    return buf.getvalue()
+
+
+# -----------------------------------------------------------
+# Vision analysis — Stage 1
+# -----------------------------------------------------------
+
+
+def _structured_vision_call(operation, kwargs, provider, model, multiplier=1):
+    diagnostics = dict(requested=True, applied='schema')
+    result = None
+    try:
+        result = structured_completion(
+            operation, kwargs, provider, model, ResponseContract('vision'),
+            diagnostics, log, multiplier,
+        )
+    except Exception as exc:
+        category = ('dependency_missing'
+                    if isinstance(exc, StructuredDependencyError) else
+                    diagnostics.get('validation', 'invalid_response')
+                    if isinstance(exc, StructuredOutputError) else
+                    structured_rejection_category(exc, provider))
+        if category:
+            diagnostics['error_category'] = category
+            log_structured_failure(provider, model,
+                                   diagnostics.get('schema_id'), category, log,
+                                   diagnostics=diagnostics,
+                                   label='screenshot_vision', error=exc)
+        else:
+            log.error('Vision API call failed: %s', exc)
+    return result
+
+
+def _call_anthropic(
+    jpeg_b64: str, client, model: str,
+    *, structured_output=False,
+) -> 'str | None':
+    request_kwargs = dict(
+        model=model,
+        max_tokens=300,
+        system=VISION_SYSTEM,
+        messages=[{
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": jpeg_b64,
+                },
+            }, {
+                "type": "text",
+                "text": "What do you see in this scene?",
+            }],
+        }],
+    )
+    if structured_output:
+        return _structured_vision_call(
+            client.messages.create, request_kwargs, 'anthropic', model,
+        )
+    resp = client.messages.create(**request_kwargs)
+    return resp.content[0].text.strip()
+
+
+def _call_openai(
+    jpeg_b64: str,
+    client,
+    model: str,
+    provider: str = 'openai',
+    reasoning_effort: str = '',
+    max_tokens_multiplier: float = 4,
+    *, structured_output=False,
+) -> 'str | None':
+    if provider != 'openai':
+        reasoning_effort = ''
+    max_tokens = 300
+    if needs_reasoning_token_multiplier(
+        provider, model, reasoning_effort
+    ):
+        multiplier = max(1.0, min(max_tokens_multiplier, 8.0))
+        max_tokens = int(max_tokens * multiplier)
+    request_kwargs = {
+        'model': model,
+        'messages': [{
+            "role": "system",
+            "content": VISION_SYSTEM,
+        }, {
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": (
+                        "data:image/jpeg;base64,"
+                        + jpeg_b64
+                    ),
+                },
+            }, {
+                "type": "text",
+                "text": "What do you see in this scene?",
+            }],
+        }],
+    }
+    request_kwargs.update(build_chat_options(
+        provider,
+        model,
+        max_tokens,
+        reasoning_effort=reasoning_effort,
+    ))
+    if structured_output:
+        return _structured_vision_call(
+            client.chat.completions.create, request_kwargs, provider, model,
+            max_tokens_multiplier,
+        )
+    resp = create_chat_completion(
+        client.chat.completions.create,
+        request_kwargs,
+        provider,
+        model,
+        log,
+        reasoning_token_multiplier=max_tokens_multiplier,
+    )
+    content = resp.choices[0].message.content
+    if not content:
+        finish_reason = getattr(
+            resp.choices[0], 'finish_reason', None)
+        log.warning(
+            "Vision API returned no text content: "
+            "finish_reason=%s",
+            finish_reason,
+        )
+        return None
+    return content.strip()
+
+
+def analyze_screenshot(
+    jpeg_bytes: bytes,
+    client,
+    model: str,
+    provider: str = 'openai',
+    reasoning_effort: str = '',
+    max_tokens_multiplier: float = 4,
+    *, structured_output=False,
+) -> 'dict | None':
+    """Send screenshot to vision LLM, return structured
+    description or None if uninteresting / error."""
+    b64 = base64.standard_b64encode(jpeg_bytes).decode()
+
+    try:
+        if provider == 'anthropic':
+            raw = _call_anthropic(
+                b64, client, model, structured_output=structured_output,
+            )
+        else:
+            raw = _call_openai(
+                b64,
+                client,
+                model,
+                provider,
+                reasoning_effort,
+                max_tokens_multiplier,
+                structured_output=structured_output,
+            )
+    except Exception as e:
+        log.error("Vision API call failed: %s", e)
+        return None
+
+    if not raw:
+        return None
+
+    # Robust JSON extraction — handle markdown fences
+    if structured_output:
+        json_text = raw
+    else:
+        match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+        if not match:
+            log.warning("No JSON found in vision response")
+            return None
+        json_text = match.group()
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError:
+        log.warning("JSON parse failed for vision response")
+        return None
+
+    desc_fields = ['atmosphere', 'environment', 'creatures']
+    tag_fields = ['landmark_type', 'biome', 'weather']
+    has_desc = any(
+        _is_value_present(data.get(k))
+        for k in desc_fields
+    )
+    has_tag = any(
+        _is_value_present(data.get(k))
+        for k in tag_fields
+    )
+    if not has_desc and not has_tag:
+        reason = data.get('skip_reason', 'no reason given')
+        log.info("Vision: skipped — %s", reason)
+        return None
+
+    return data
+
+
+# -----------------------------------------------------------
+# Dedup — canonical tag comparison
+# -----------------------------------------------------------
+
+def _is_value_present(val) -> bool:
+    """True if a vision JSON value is meaningful."""
+    return bool(val) and str(val).lower() not in (
+        'null', 'none', '')
+
+
+_last_tags: 'tuple | None' = None
+
+
+def _extract_tags(desc: dict) -> tuple:
+    """Extract canonical dedup key from vision output."""
+    return (
+        str(desc.get('landmark_type') or 'none').lower(),
+        str(desc.get('biome') or 'none').lower(),
+        str(desc.get('weather') or 'none').lower(),
+        str(desc.get('time_of_day') or 'unknown').lower(),
+        _is_value_present(desc.get('creatures')),
+    )
+
+
+def is_duplicate(new_desc: dict) -> bool:
+    """Check if canonical tags match the last observation."""
+    global _last_tags
+    new_tags = _extract_tags(new_desc)
+    if _last_tags is None:
+        return False
+    return new_tags == _last_tags
+
+
+def update_dedup_cache(desc: dict) -> None:
+    """Call after successful queue insert."""
+    global _last_tags
+    _last_tags = _extract_tags(desc)
+
+
+# -----------------------------------------------------------
+# Database helpers
+# -----------------------------------------------------------
+
+
+def get_db_connection(config: dict):
+    """Open a MySQL connection to acore_characters."""
+    return mysql.connector.connect(
+        host=config['db_host'],
+        port=config['db_port'],
+        user=config['db_user'],
+        password=config['db_pass'],
+        database=config['db_name'],
+        # See issue #31: buffered cursors avoid cext
+        # "Unread result found" errors.
+        buffered=True,
+    )
+
+
+def get_bound_player_group(
+    db, account_id: int,
+) -> 'dict | None':
+    """Find the group for a specific player account."""
+    cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT gm.guid AS group_id,
+                   c.zone, c.map
+            FROM characters c
+            JOIN group_member gm
+                ON gm.memberGuid = c.guid
+            WHERE c.account = %s
+              AND c.online = 1
+            LIMIT 1
+        """, (account_id,))
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+
+    if not row:
+        return None
+
+    # Pick a random current bot from the group as speaker.
+    cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT t.bot_guid, t.bot_name,
+                   t.travel_mode, t.travel_context,
+                   t.is_mounted, t.is_flying,
+                   t.is_taxi_flying, t.is_on_transport,
+                   t.mount_display_id, t.transport_name
+            FROM llm_group_bot_traits t
+            JOIN group_member bot_gm
+                ON bot_gm.guid = t.group_id
+                AND bot_gm.memberGuid = t.bot_guid
+            WHERE t.group_id = %s
+            ORDER BY RAND()
+            LIMIT 1
+        """, (row['group_id'],))
+        bot = cursor.fetchone()
+    finally:
+        cursor.close()
+
+    if not bot:
+        return None
+
+    row.update(bot)
+    return row
+
+
+def get_active_group_fallback(db) -> 'dict | None':
+    """Fallback: find a random group bot whose group has an
+    online real player. Used when BoundAccountId is not set.
+    Real players are identified the same way as
+    chatter_db.get_real_player_guid_for_group: not a traits
+    bot in that group and not on an RNDBOT account."""
+    cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT t.group_id, t.bot_guid, t.bot_name,
+                   t.travel_mode, t.travel_context,
+                   t.is_mounted, t.is_flying,
+                   t.is_taxi_flying, t.is_on_transport,
+                   t.mount_display_id, t.transport_name,
+                   c.zone, c.map
+            FROM llm_group_bot_traits t
+            JOIN group_member bot_gm
+                ON bot_gm.guid = t.group_id
+                AND bot_gm.memberGuid = t.bot_guid
+            JOIN group_member gm
+                ON gm.guid = t.group_id
+            JOIN characters c
+                ON c.guid = gm.memberGuid
+                AND c.online = 1
+            JOIN acore_auth.account a
+                ON a.id = c.account
+            LEFT JOIN llm_group_bot_traits pt
+                ON pt.group_id = gm.guid
+                AND pt.bot_guid = gm.memberGuid
+            WHERE pt.bot_guid IS NULL
+              AND a.username NOT LIKE 'RNDBOT%'
+            ORDER BY RAND()
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+    return row
+
+
+def queue_screenshot_event(
+    db,
+    group_info: dict,
+    description: dict,
+) -> None:
+    """Insert screenshot observation into events table.
+    Zone name is resolved by the bridge handler, not here.
+    """
+    travel_state = None
+    if group_info.get('travel_mode'):
+        travel_state = {
+            "mode": str(group_info.get('travel_mode') or ''),
+            "context": str(
+                group_info.get('travel_context') or ''),
+            "mounted": bool(group_info.get('is_mounted')),
+            "flying": bool(group_info.get('is_flying')),
+            "taxi_flight": bool(
+                group_info.get('is_taxi_flying')),
+            "on_transport": bool(
+                group_info.get('is_on_transport')),
+            "mount_display_id": int(
+                group_info.get('mount_display_id') or 0),
+            "transport_name": str(
+                group_info.get('transport_name') or ''),
+        }
+
+    payload = {
+        "bot_guid":      group_info['bot_guid'],
+        "bot_name":      group_info['bot_name'],
+        "group_id":      group_info['group_id'],
+        "landmark_type": str(
+            description.get('landmark_type') or 'none'),
+        "weather":       str(
+            description.get('weather') or 'none'),
+        "time_of_day":   str(
+            description.get('time_of_day') or 'unknown'),
+        "biome":         str(
+            description.get('biome') or 'none'),
+        "atmosphere":    str(
+            description.get('atmosphere') or ''),
+        "environment":   str(
+            description.get('environment') or ''),
+        "creatures":     str(
+            description.get('creatures') or ''),
+    }
+    if travel_state:
+        payload["travel_state"] = travel_state
+
+    extra = json.dumps(payload)
+    cursor = db.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO llm_chatter_events
+                (event_type, event_scope, zone_id, map_id,
+                 priority, subject_guid, subject_name,
+                 extra_data, status, react_after,
+                 expires_at)
+            VALUES
+                ('bot_group_screenshot_observation',
+                 'player', %s, %s, 10, %s, %s, %s,
+                 'pending',
+                 DATE_ADD(NOW(), INTERVAL 2 SECOND),
+                 DATE_ADD(NOW(), INTERVAL 120 SECOND))
+        """, (
+            group_info['zone'],
+            group_info['map'],
+            group_info['bot_guid'],
+            group_info['bot_name'],
+            extra,
+        ))
+        db.commit()
+    finally:
+        cursor.close()
+
+
+# -----------------------------------------------------------
+# Main loop
+# -----------------------------------------------------------
+
+
+def _do_capture_cycle(
+    config: dict,
+    vision_client: 'anthropic.Anthropic',
+) -> None:
+    """Single capture-analyze-queue cycle."""
+    if not is_wow_foreground():
+        log.info('Screenshot skipped: WoW is not the foreground window')
+        return
+
+    # Resolve the routes independently before paying for vision.
+    group_info = None
+    ticket = None
+    account_id = config.get('bound_account_id', 0)
+    log.info('WoW is focused; checking Party recipients (account=%s)',
+             account_id or 'automatic group selection')
+    try:
+        db = get_db_connection(config)
+        try:
+            if account_id:
+                group_info = get_bound_player_group(db, account_id)
+            else:
+                group_info = get_active_group_fallback(db)
+        finally:
+            db.close()
+    except Exception:
+        log.exception('Screenshot Party eligibility failed')
+
+    if group_info is None:
+        log.info('Party: no eligible grouped bot found')
+    else:
+        log.info('Party: recipient=%s, zone=%s',
+                 group_info['bot_name'], group_info['zone'])
+    proximity_attempt = False
+    proximity_reason = 'disabled'
+    if config.get('proximity_enable'):
+        if not account_id:
+            proximity_reason = 'no account binding'
+        else:
+            proximity_roll = random.randint(1, 100)
+            proximity_attempt = proximity_roll <= config['proximity_chance']
+            log.info('Proximity: roll=%d, chance=%d%% -> %s',
+                     proximity_roll, config['proximity_chance'],
+                     'request server preflight' if proximity_attempt else 'skip')
+            proximity_reason = (
+                'no server ticket (see preflight log)' if proximity_attempt
+                else 'chance roll skipped; NPC eligibility not checked')
+    if not proximity_attempt:
+        log.info('Proximity: %s', proximity_reason)
+    if proximity_attempt:
+        try:
+            db = get_db_connection(config)
+            try:
+                ticket = request_ticket(
+                    db, account_id, config['proximity_request_timeout'])
+            finally:
+                db.close()
+        except Exception:
+            proximity_reason = 'preflight error'
+            log.exception('Screenshot proximity preflight failed')
+
+    if group_info is None and ticket is None:
+        log.info('Screenshot skipped: no Party recipient; proximity: %s',
+                 proximity_reason)
+        return
+
+    log.info('Capture routes: Party=%s, proximity=%s',
+             'eligible' if group_info is not None else 'unavailable',
+             'approved' if ticket is not None else 'unavailable')
+    # -- Capture and analyze --
+    # Preflight can wait several seconds; the player may have alt-tabbed.
+    if not is_wow_foreground():
+        log.info('Screenshot skipped: WoW lost focus during preflight')
+        return
+    capture_started = time.monotonic()
+    log.info('Capturing WoW client area, cropping UI and encoding JPEG')
+    img = capture_wow_window()
+    if img is None:
+        log.warning('Screenshot capture returned no image; ending cycle')
+        return
+
+    try:
+        cropped = crop_screenshot(img)
+        jpeg_bytes = compress_screenshot(
+            cropped,
+            max_width=config['max_width_px'],
+            jpeg_quality=config['jpeg_quality'],
+        )
+    finally:
+        img.close()
+    log.info(
+        "Captured screenshot: %d bytes in %.2fs",
+        len(jpeg_bytes), time.monotonic() - capture_started,
+    )
+
+    # To save captures for debugging, uncomment:
+    # import os
+    # from datetime import datetime
+    # dbg_dir = os.path.join(
+    #     os.path.dirname(__file__),
+    #     '..', 'logs', 'screenshots')
+    # os.makedirs(dbg_dir, exist_ok=True)
+    # ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # with open(os.path.join(
+    #         dbg_dir, f'screenshot_{ts}.jpg'),
+    #         'wb') as f:
+    #     f.write(jpeg_bytes)
+
+    vision_started = time.monotonic()
+    log.info('Vision request started: provider=%s, model=%s',
+             config['vision_provider'], config['vision_model'])
+    description = analyze_screenshot(
+        jpeg_bytes,
+        vision_client,
+        config['vision_model'],
+        provider=config['vision_provider'],
+        reasoning_effort=config['openai_reasoning_effort'],
+        max_tokens_multiplier=(
+            config['openai_max_tokens_multiplier']
+        ),
+        structured_output=config.get('structured_output', False),
+    )
+    log.info('Vision analysis finished in %.2fs',
+             time.monotonic() - vision_started)
+    if description is None:
+        log.info('Vision returned no usable scene; nothing will be published')
+        return
+
+    log.info(
+        "Vision: landmark=%s biome=%s weather=%s",
+        description.get('landmark_type', 'none'),
+        description.get('biome', 'none'),
+        description.get('weather', 'none'),
+    )
+
+    # Party dedup belongs only to Party. Neither publication can suppress
+    # the other, even if its database operation fails.
+    party_duplicate = group_info is not None and is_duplicate(description)
+    if party_duplicate:
+        log.info('Vision: duplicate Party scene, skipping Party')
+    if group_info is not None and not party_duplicate:
+        log.info('Party: scene passed dedup; inserting observation event')
+        try:
+            db = get_db_connection(config)
+            try:
+                queue_screenshot_event(db, group_info, description)
+                update_dedup_cache(description)
+                log.info('Queued observation: %s (zone_id=%s)',
+                         group_info['bot_name'], group_info['zone'])
+            finally:
+                db.close()
+        except Exception:
+            log.exception('Screenshot Party publication failed')
+    if ticket is not None:
+        log.info('Proximity: publishing visual observation for server validation')
+        try:
+            db = get_db_connection(config)
+            try:
+                publish_observation(db, ticket, description)
+            finally:
+                db.close()
+        except Exception:
+            log.exception('Screenshot proximity publication failed')
+
+
+def _create_vision_client(config: dict):
+    """Create the vision API client based on provider."""
+    provider = config['vision_provider']
+    if provider == 'anthropic':
+        import anthropic
+        return anthropic.Anthropic(
+            api_key=config['anthropic_api_key'])
+    if provider == 'google':
+        import openai
+        return openai.OpenAI(
+            api_key=config['google_api_key'],
+            base_url=config['google_base_url'])
+    if provider == 'openrouter':
+        import openai
+        headers = {}
+        if config['openrouter_http_referer']:
+            headers['HTTP-Referer'] = (
+                config['openrouter_http_referer']
+            )
+        if config['openrouter_title']:
+            headers['X-OpenRouter-Title'] = (
+                config['openrouter_title']
+            )
+        kwargs = {
+            'api_key': config['openrouter_api_key'],
+            'base_url': config['openrouter_base_url'],
+        }
+        if headers:
+            kwargs['default_headers'] = headers
+        return openai.OpenAI(**kwargs)
+    else:
+        import openai
+        return openai.OpenAI(
+            api_key=config['openai_api_key'])
+
+
+def run_agent(config: dict) -> None:
+    """Main agent loop — runs indefinitely."""
+    reset_structured_diagnostics()
+    if not check_structured_dependencies(
+        config.get('structured_output', False), log,
+    ):
+        sys.exit(1)
+    vision_client = _create_vision_client(config)
+    log_structured_target('vision', config['vision_provider'],
+                          config['vision_model'],
+                          config.get('structured_output', False), log)
+    log.info(
+        "Screenshot agent started "
+        "(interval=%d-%ds, chance=%d%%)",
+        config['interval_min_seconds'],
+        config['interval_max_seconds'],
+        config['chance'],
+    )
+    log.info('Proximity enabled=%s, chance=%d%%, bound account=%s; '
+             'publication does not confirm NPC speech delivery',
+             config.get('proximity_enable', False),
+             config.get('proximity_chance', 30),
+             config.get('bound_account_id', 0))
+    cycle = 0
+    while True:
+        cycle += 1
+        interval = random.randint(
+            config['interval_min_seconds'],
+            config['interval_max_seconds'],
+        )
+        log.info('Cycle %d: waiting %d seconds; next check at %s',
+                 cycle, interval,
+                 time.strftime('%H:%M:%S', time.localtime(time.time() + interval)))
+        time.sleep(interval)
+
+        roll = random.randint(1, 100)
+        if roll > config['chance']:
+            log.info('Screenshot cycle skipped: capture roll %d exceeds %d%%',
+                     roll, config['chance'])
+            continue
+
+        log.info('Screenshot cycle: capture roll passed; checking recipients')
+        try:
+            cycle_started = time.monotonic()
+            _do_capture_cycle(config, vision_client)
+        except Exception as e:
+            log.error("Capture cycle failed: %s", e)
+            continue
+        finally:
+            log.info('Cycle %d finished in %.2fs; scheduling next wait',
+                     cycle, time.monotonic() - cycle_started)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Screenshot Vision Agent',
+    )
+    parser.add_argument(
+        '--config', required=True,
+        help='Path to mod_llm_chatter.conf',
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            '%(asctime)s %(levelname)s '
+            '[%(name)s] %(message)s'
+        ),
+    )
+
+    raw = parse_config(args.config)
+    config = load_screenshot_config(raw)
+
+    if not config['enable']:
+        log.error(
+            "LLMChatter.Screenshot.Enable is not set to 1")
+        sys.exit(1)
+
+    provider = config['vision_provider']
+    if provider == 'anthropic':
+        if not config['anthropic_api_key']:
+            log.error(
+                "LLMChatter.Anthropic.ApiKey not set")
+            sys.exit(1)
+    elif provider == 'google':
+        if not config['google_api_key']:
+            log.error(
+                "LLMChatter.Google.ApiKey not set")
+            sys.exit(1)
+    elif provider == 'openrouter':
+        if not config['openrouter_api_key']:
+            log.error(
+                "LLMChatter.OpenRouter.ApiKey not set")
+            sys.exit(1)
+    else:
+        if not config['openai_api_key']:
+            log.error(
+                "LLMChatter.OpenAI.ApiKey not set")
+            sys.exit(1)
+
+    try:
+        run_agent(config)
+    except KeyboardInterrupt:
+        log.info("Screenshot agent stopped")
+
+
+if __name__ == '__main__':
+    main()

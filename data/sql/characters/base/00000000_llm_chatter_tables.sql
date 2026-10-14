@@ -1,0 +1,380 @@
+-- --------------------------------------------------------
+-- LLM Chatter Module Tables
+-- Dynamic bot conversations powered by AI
+-- --------------------------------------------------------
+
+-- Event queue for game events that may trigger chatter
+CREATE TABLE IF NOT EXISTS `llm_chatter_events` (
+    `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `event_type` ENUM(
+        'weather_change',
+        'holiday_start',
+        'holiday_end',
+        'creature_death_boss',
+        'creature_death_rare',
+        'creature_death_guard',
+        'player_enters_zone',
+        'bot_pvp_kill',
+        'bot_level_up',
+        'bot_achievement',
+        'bot_quest_complete',
+        'world_boss_spawn',
+        'rare_spawn',
+        'transport_arrives',
+        'day_night_transition',
+        'enemy_player_near',
+        'bot_loot_item',
+        'bot_group_join',
+        'bot_group_kill',
+        'bot_group_death',
+        'bot_group_loot',
+        'bot_group_player_msg',
+        'bot_group_general_reaction',
+        'bot_group_combat',
+        'bot_group_levelup',
+        'bot_group_quest_complete',
+        'bot_group_achievement',
+        'bot_group_spell_cast',
+        'bot_group_quest_objectives',
+        'bot_group_resurrect',
+        'bot_group_zone_transition',
+        'bot_group_dungeon_entry',
+        'bot_group_wipe',
+        'bot_group_corpse_run',
+        'player_general_msg',
+        'minor_event',
+        'bot_group_low_health',
+        'bot_group_oom',
+        'bot_group_aggro_loss',
+        'bot_group_quest_accept',
+        'bot_group_quest_accept_batch',
+        'weather_ambient',
+        'bot_group_nearby_object',
+        'bot_group_join_batch',
+        'bg_match_start',
+        'bg_match_end',
+        'bg_pvp_kill',
+        'bg_flag_picked_up',
+        'bg_flag_dropped',
+        'bg_flag_captured',
+        'bg_flag_returned',
+        'bg_node_contested',
+        'bg_node_captured',
+        'bg_score_milestone',
+        'bg_idle_chatter',
+        'bg_player_arrival',
+        'raid_boss_pull',
+        'raid_boss_kill',
+        'raid_boss_wipe',
+        'raid_idle_morale',
+        'bot_group_farewell',
+        'bot_group_subzone_change',
+        'bot_group_emote_observer',
+        'bot_group_emote_reaction',
+        'bot_group_screenshot_observation',
+        'proximity_say',
+        'proximity_conversation',
+        'proximity_reply',
+        'proximity_player_say',
+        'proximity_player_conversation',
+        'proximity_player_emote',
+        'proximity_boss_approach',
+        'proximity_boss_player_say',
+        'bot_backstory_regen',
+        'bot_tone_regen',
+        'guild_idle_chatter',
+        'guild_player_message',
+        'guild_login_greeting',
+        'bot_group_duel_start',
+        'bot_group_duel_end'
+    ) NOT NULL,
+    `event_scope` ENUM('global', 'zone', 'player') NOT NULL DEFAULT 'zone',
+    `zone_id` INT UNSIGNED DEFAULT NULL,
+    `map_id` INT UNSIGNED DEFAULT NULL,
+    `priority` TINYINT UNSIGNED NOT NULL DEFAULT 5,
+    `cooldown_key` VARCHAR(64) DEFAULT NULL,
+    `subject_guid` INT UNSIGNED DEFAULT NULL,
+    `subject_name` VARCHAR(64) DEFAULT NULL,
+    `target_guid` INT UNSIGNED DEFAULT NULL,
+    `target_name` VARCHAR(128) DEFAULT NULL,
+    `target_entry` INT UNSIGNED DEFAULT NULL,
+    `extra_data` JSON DEFAULT NULL,
+    `status` ENUM('pending', 'processing', 'completed', 'expired', 'skipped') NOT NULL DEFAULT 'pending',
+    `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `react_after` TIMESTAMP NULL DEFAULT NULL,
+    `expires_at` TIMESTAMP NULL DEFAULT NULL,
+    `processed_at` TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_status_priority` (`status`, `priority`, `created_at`),
+    KEY `idx_zone` (`zone_id`, `status`),
+    KEY `idx_cooldown` (`cooldown_key`, `created_at`),
+    KEY `idx_react_after` (`status`, `react_after`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Queue for chatter requests (sent to Python bridge)
+CREATE TABLE IF NOT EXISTS `llm_chatter_queue` (
+    `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `request_type` ENUM('statement', 'conversation') NOT NULL DEFAULT 'statement',
+    `bot1_guid` INT UNSIGNED NOT NULL,
+    `bot1_name` VARCHAR(64) NOT NULL,
+    `bot1_class` VARCHAR(32) NOT NULL,
+    `bot1_race` VARCHAR(32) NOT NULL,
+    `bot1_level` TINYINT UNSIGNED NOT NULL,
+    `bot1_zone` VARCHAR(128) NOT NULL,
+    `zone_id` INT UNSIGNED DEFAULT NULL,
+    `weather` VARCHAR(32) DEFAULT NULL,
+    `bot_count` TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    `message_type` VARCHAR(16) DEFAULT NULL,
+    `item_context` JSON DEFAULT NULL,
+    `bot2_guid` INT UNSIGNED DEFAULT NULL,
+    `bot2_name` VARCHAR(64) DEFAULT NULL,
+    `bot2_class` VARCHAR(32) DEFAULT NULL,
+    `bot2_race` VARCHAR(32) DEFAULT NULL,
+    `bot2_level` TINYINT UNSIGNED DEFAULT NULL,
+    `bot3_guid` INT UNSIGNED DEFAULT NULL,
+    `bot3_name` VARCHAR(64) DEFAULT NULL,
+    `bot3_class` VARCHAR(32) DEFAULT NULL,
+    `bot3_race` VARCHAR(32) DEFAULT NULL,
+    `bot3_level` TINYINT UNSIGNED DEFAULT NULL,
+    `bot4_guid` INT UNSIGNED DEFAULT NULL,
+    `bot4_name` VARCHAR(64) DEFAULT NULL,
+    `bot4_class` VARCHAR(32) DEFAULT NULL,
+    `bot4_race` VARCHAR(32) DEFAULT NULL,
+    `bot4_level` TINYINT UNSIGNED DEFAULT NULL,
+    `status` ENUM('pending', 'processing', 'completed', 'failed', 'cancelled') NOT NULL DEFAULT 'pending',
+    `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `processed_at` TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_status` (`status`),
+    KEY `idx_created` (`created_at`),
+    KEY `idx_zone` (`zone_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Messages to be delivered (from completed requests or events)
+CREATE TABLE IF NOT EXISTS `llm_chatter_messages` (
+    `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `queue_id` INT UNSIGNED DEFAULT NULL,
+    `event_id` INT UNSIGNED DEFAULT NULL,
+    `sequence` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    `bot_guid` INT UNSIGNED NOT NULL,
+    `bot_name` VARCHAR(64) NOT NULL,
+    `message` TEXT NOT NULL,
+    `emote` VARCHAR(32) DEFAULT NULL,
+    -- Free-text physical action from the LLM's `action` field.
+    -- Delivered as a /e text emote just before the spoken line
+    -- rather than inlined into `message` as *asterisks*.
+    `action` VARCHAR(120) DEFAULT NULL,
+    `npc_spawn_id` INT UNSIGNED DEFAULT NULL,
+    `player_guid` INT UNSIGNED DEFAULT NULL,
+    `group_id` INT UNSIGNED DEFAULT NULL,
+    `delivery_policy` VARCHAR(24) DEFAULT NULL,
+    `delivery_reason` VARCHAR(64) DEFAULT NULL,
+    `channel` VARCHAR(32) NOT NULL DEFAULT 'general',
+    -- Owning subsystem for this row. Authoritative classifier
+    -- used by C++ delivery to honor per-subsystem master
+    -- toggles (e.g. LLMChatter.GroupChatter.Enable). Values:
+    -- 'group' (party/raid group chatter — the default),
+    -- 'raid' (PvE raid boss chatter), 'bg' (battleground),
+    -- 'general' (General channel), 'proximity' (open-world
+    -- say/msay). Defaults to 'group' because party/raid is the
+    -- dominant producer; non-group party producers set it
+    -- explicitly. See insert_chat_message() in chatter_db.py.
+    `owner_subsystem` VARCHAR(16) NOT NULL DEFAULT 'group',
+    `delivered` TINYINT(1) NOT NULL DEFAULT 0,
+    `drop_reason` VARCHAR(64) DEFAULT NULL,
+    `addressee_player_guid` INT UNSIGNED DEFAULT NULL,
+    `addressee_bot_guid` INT UNSIGNED DEFAULT NULL,
+    `addressee_npc_spawn_id` INT UNSIGNED DEFAULT NULL,
+    `deliver_at` TIMESTAMP NULL DEFAULT NULL,
+    `delivered_at` TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_queue` (`queue_id`),
+    KEY `idx_event` (`event_id`),
+    KEY `idx_delivery` (`delivered`, `deliver_at`),
+    KEY `idx_party_gate`
+        (`channel`, `group_id`, `delivered`, `deliver_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Per-group party chat pacing reservations.
+CREATE TABLE IF NOT EXISTS `llm_party_chat_pacing` (
+    `group_id` INT UNSIGNED NOT NULL,
+    `next_available_at` TIMESTAMP NULL DEFAULT NULL,
+    `last_activity_at` TIMESTAMP NULL DEFAULT NULL,
+    `last_policy` VARCHAR(24) DEFAULT NULL,
+    `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`group_id`),
+    KEY `idx_updated_at` (`updated_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Personality traits for bots in player groups
+CREATE TABLE IF NOT EXISTS `llm_group_bot_traits` (
+    `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `group_id` INT UNSIGNED NOT NULL,
+    `bot_guid` INT UNSIGNED NOT NULL,
+    `bot_name` VARCHAR(64) NOT NULL,
+    `trait1` VARCHAR(64) NOT NULL,
+    `trait2` VARCHAR(64) NOT NULL,
+    `trait3` VARCHAR(64) NOT NULL,
+    `role` VARCHAR(16) DEFAULT NULL,
+    `tone` VARCHAR(120) DEFAULT NULL,
+    `zone` INT UNSIGNED NOT NULL DEFAULT 0,
+    `area` INT UNSIGNED NOT NULL DEFAULT 0,
+    `map` INT UNSIGNED NOT NULL DEFAULT 0,
+    `travel_mode` VARCHAR(32) DEFAULT NULL,
+    `travel_context` VARCHAR(512) DEFAULT NULL,
+    `is_mounted` TINYINT(1) NOT NULL DEFAULT 0,
+    `is_flying` TINYINT(1) NOT NULL DEFAULT 0,
+    `is_taxi_flying` TINYINT(1) NOT NULL DEFAULT 0,
+    `is_on_transport` TINYINT(1) NOT NULL DEFAULT 0,
+    `mount_display_id` INT UNSIGNED NOT NULL DEFAULT 0,
+    `transport_name` VARCHAR(128) DEFAULT NULL,
+    `travel_updated_at` TIMESTAMP NULL DEFAULT NULL,
+    `farewell_msg` VARCHAR(255) DEFAULT NULL,
+    `backstory` TEXT DEFAULT NULL,
+    `assigned_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_group_bot` (`group_id`, `bot_guid`),
+    INDEX `idx_group` (`group_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Chat history for General channel conversations (per-zone)
+CREATE TABLE IF NOT EXISTS `llm_general_chat_history` (
+    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    `zone_id` INT UNSIGNED NOT NULL,
+    `speaker_name` VARCHAR(64) NOT NULL,
+    `is_bot` TINYINT(1) NOT NULL DEFAULT 0,
+    `message` TEXT NOT NULL,
+    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_zone_id` (`zone_id`),
+    INDEX `idx_created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Per-player Guild Chat memory for one login session.
+CREATE TABLE IF NOT EXISTS `llm_guild_chat_sessions` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `player_guid` INT UNSIGNED NOT NULL,
+    `player_name` VARCHAR(64) NOT NULL,
+    `guild_id` INT UNSIGNED NOT NULL,
+    `turn_id` INT UNSIGNED NOT NULL DEFAULT 0,
+    `summary` TEXT DEFAULT NULL,
+    `summarized_through_id` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    `started_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `last_activity_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_guild_session_player` (`player_guid`),
+    KEY `idx_guild_session_guild` (`guild_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Delivered Guild lines visible during each player's login session.
+CREATE TABLE IF NOT EXISTS `llm_guild_session_history` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `session_id` BIGINT UNSIGNED NOT NULL,
+    `guild_id` INT UNSIGNED NOT NULL,
+    `speaker_guid` INT UNSIGNED NOT NULL DEFAULT 0,
+    `speaker_name` VARCHAR(64) NOT NULL,
+    `is_bot` TINYINT(1) NOT NULL DEFAULT 0,
+    `source_kind` ENUM(
+        'player',
+        'reply',
+        'ambient'
+    ) NOT NULL,
+    `source_event_id` INT UNSIGNED DEFAULT NULL,
+    `message` TEXT NOT NULL,
+    `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `delivered_at` TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_guild_history_session`
+        (`session_id`, `id`),
+    KEY `idx_guild_history_guild`
+        (`guild_id`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Pre-cached LLM responses for instant combat delivery
+CREATE TABLE IF NOT EXISTS `llm_group_cached_responses` (
+    `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `group_id` INT UNSIGNED NOT NULL,
+    `bot_guid` INT UNSIGNED NOT NULL,
+    `event_category` VARCHAR(48) NOT NULL,
+    `message` VARCHAR(255) NOT NULL,
+    `emote` VARCHAR(32) DEFAULT NULL,
+    `status` ENUM('ready','used','expired') NOT NULL DEFAULT 'ready',
+    `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `expires_at` TIMESTAMP NULL DEFAULT NULL,
+    `used_at` TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_lookup` (`group_id`, `bot_guid`, `event_category`, `status`, `created_at`),
+    KEY `idx_expiry` (`status`, `expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Chat history for group conversations (provides context)
+CREATE TABLE IF NOT EXISTS `llm_group_chat_history` (
+    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    `group_id` INT UNSIGNED NOT NULL,
+    `speaker_guid` INT UNSIGNED NOT NULL,
+    `speaker_name` VARCHAR(64) NOT NULL,
+    `is_bot` TINYINT(1) NOT NULL DEFAULT 0,
+    `message` VARCHAR(255) NOT NULL,
+    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_group_id` (`group_id`),
+    INDEX `idx_created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Persistent bot identities (traits + farewell survive across sessions)
+-- NOTE: No DROP TABLE — this data is persistent across sessions/restarts
+CREATE TABLE IF NOT EXISTS `llm_bot_identities` (
+    `bot_guid`         INT UNSIGNED NOT NULL PRIMARY KEY,
+    `bot_name`         VARCHAR(12)  NOT NULL,
+    `trait1`           VARCHAR(64)  NOT NULL,
+    `trait2`           VARCHAR(64)  NOT NULL,
+    `trait3`           VARCHAR(64)  NOT NULL,
+    `role`             VARCHAR(32)  DEFAULT NULL,
+    `tone`             VARCHAR(120) DEFAULT NULL,
+    `farewell_msg`     VARCHAR(255) DEFAULT NULL,
+    `backstory`        TEXT         DEFAULT NULL,
+    `identity_version` INT UNSIGNED NOT NULL DEFAULT 1,
+    `created_at`       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Bot memories (accumulated journal of moments shared with players)
+-- NOTE: No DROP TABLE — this data is persistent across sessions/restarts
+CREATE TABLE IF NOT EXISTS `llm_bot_memories` (
+    `id`            INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    `bot_guid`      INT UNSIGNED NOT NULL,
+    `player_guid`   INT UNSIGNED NOT NULL,
+    `group_id`      INT UNSIGNED NOT NULL,
+    `memory_type`   ENUM(
+        'ambient', 'boss_kill', 'wipe', 'rare_kill',
+        'dungeon', 'party_member', 'player_message',
+        'first_meeting', 'quest_complete', 'achievement',
+        'level_up', 'bg_win', 'bg_loss',
+        'discovery', 'pvp_kill'
+    ) NOT NULL,
+    `memory`        TEXT         NOT NULL,
+    `mood`          VARCHAR(32)  NOT NULL,
+    `emote`         VARCHAR(32)  DEFAULT NULL,
+    `active`        TINYINT(1)   NOT NULL DEFAULT 0,
+    `used`          TINYINT(1)   NOT NULL DEFAULT 0,
+    `last_used_at`  TIMESTAMP    NULL DEFAULT NULL,
+    `session_start` DOUBLE       NOT NULL,
+    `created_at`    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_bot_player`        (`bot_guid`, `player_guid`),
+    INDEX `idx_bot_player_active` (`bot_guid`, `player_guid`, `active`),
+    INDEX `idx_group`             (`group_id`, `active`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- One outstanding screenshot preflight per explicitly bound account.
+-- Server snapshots stay in memory: restart invalidates pending captures.
+CREATE TABLE IF NOT EXISTS `llm_screenshot_proximity` (
+    `account_id` INT UNSIGNED NOT NULL,
+    `request_token` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `state` ENUM('requested', 'ready', 'observed', 'consumed') NOT NULL,
+    `player_guid` INT UNSIGNED DEFAULT NULL,
+    `observation` TEXT DEFAULT NULL,
+    `requested_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `expires_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`account_id`),
+    UNIQUE KEY `uq_request_token` (`request_token`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

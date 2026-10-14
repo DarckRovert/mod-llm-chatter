@@ -1,0 +1,3956 @@
+#
+# LLM Chatter Module Configuration - Quieter Production Preset
+#
+# This optional preset lives outside the conf/*.conf.dist build scan, so it
+# is not registered for automatic loading. To use it, copy it into the
+# server's module-config directory
+# and rename the copy to exactly:
+#
+#   mod_llm_chatter.conf
+#
+# Configure the database connection and one LLM provider/API key in the copied
+# file before starting the bridge. All credentials are intentionally blank in
+# this distributable preset. Debug logging, full request logging, and the
+# optional host-side screenshot agent are also disabled for normal production
+# use. Enable those only when deliberately needed.
+#
+# This preset keeps important combat, dungeon, raid, boss, and player-directed
+# reactions lively while reducing cumulative ambient chatter. Outdoor
+# proximity uses a 5% chance per 30-second scan; ambient General uses 15% per
+# 30-second zone check. Dungeon and raid proximity remain highly available.
+#
+# LLM Chatter Module Configuration
+#
+# Dynamic bot conversations powered by AI
+# Replaces static database messages with contextual, personality-driven chatter
+#
+# RECOMMENDED MODELS:
+#
+#   This module has been tested extensively with Claude Haiku 4.5 (Anthropic)
+#   and GPT-4o-mini (OpenAI) with excellent results. Gemini Flash models
+#   and OpenRouter-hosted OpenAI-compatible models can also work well
+#   when you prefer those APIs. These models are recommended for their
+#   speed and low cost, ideal for high-volume
+#   LLM calls (ambient chatter, group reactions,
+#   battleground events, pre-cache, state callouts).
+#
+#   The module runs best with models that deliver sub-5 second response times.
+#   Any provider that meets this latency target will work well, including:
+#   - Anthropic / OpenAI / Google / OpenRouter cloud APIs
+#   - Ollama cloud-hosted models
+#   - Local inference with very fast hardware (high-end GPU + small model)
+#
+#   LOCAL INFERENCE WARNING:
+#   Running models locally on consumer hardware typically produces 15-70 second
+#   latency per call. During high-activity scenarios (battlegrounds, large groups),
+#   LLM calls queue up faster than they can be processed, causing:
+#   - Stale reactions arriving long after the triggering event
+#   - Queue buildup during combat (calls process serially)
+#   - Smaller models (< 4B params) may produce malformed JSON output
+#
+#   Minimum recommended local model: qwen3:4b-instruct or equivalent (4B+ params,
+#   instruction-tuned, with reliable JSON output). Models below 4B parameters
+#   frequently fail to produce valid structured responses.
+#
+# SUPPORTED PROVIDERS:
+#   - anthropic : Claude models (Haiku 4.5 is recommended for speed and low cost) - cloud, requires API key
+#   - openai    : GPT models (GPT-4o-mini is recommended for speed and low cost) - cloud, requires API key
+#   - google    : Gemini models (Gemini 3.1 Flash-Lite / 2.5 Flash) - cloud, requires API key
+#   - openrouter: OpenRouter model routing - cloud, requires API key
+#   - ollama    : Local running on very fast hardware or cloud models
+#
+# SETUP INSTRUCTIONS:
+# 1. Copy this file to your server's config directory as mod_llm_chatter.conf
+# 2. Choose your provider and configure settings below
+# 3. Run the SQL migration to create the tables
+# 4. Start the Python bridge: python tools/llm_chatter_bridge.py --config /path/to/mod_llm_chatter.conf
+# 5. Set LLMChatter.Enable = 1 and restart the worldserver
+#
+# RESTART REQUIREMENTS:
+#   Each section is tagged with what restart is needed after changes:
+#     [SERVER]  — Restart worldserver (docker compose restart ac-dev-server)
+#     [BRIDGE]  — Restart Python bridge (docker restart ac-llm-chatter-bridge)
+#     [BOTH]    — Restart both worldserver and bridge
+#   Keys read by C++ (worldserver) require a server restart.
+#   Keys read only by Python (bridge) require a bridge restart.
+#   Some keys are read by both — those need both restarted.
+#
+# ADVANCED SETTINGS:
+#   This config only exposes operator-facing settings. Many internal tuning
+#   knobs (react delays, debounce windows, priority ranges, pre-cache depths,
+#   per-event cooldowns, etc.) have sensible defaults in code. To override
+#   any internal default, add the key to this file — the module will use
+#   your value instead. See the full key list in the source code:
+#   - C++: src/LLMChatterConfig.cpp
+#   - Python: tools/llm_chatter_bridge.py, tools/chatter_*.py
+#
+
+###############################################################################
+# ESSENTIAL SETTINGS [BOTH]
+#
+#   Configure these to get started. Most users only need to set
+#   their LLM provider and API key — everything else works out
+#   of the box.
+#
+###############################################################################
+
+#
+#   LLMChatter.Enable
+#       Enable or disable the LLM Chatter module
+#       Default: 0 (disabled)
+#
+LLMChatter.Enable = 1
+
+#
+#   LLMChatter.DebugLog
+#       Enable detailed debug logging for troubleshooting.
+#       When enabled, logs zone context passed to the LLM
+#       for each grouped bot, event processing details, and
+#       other diagnostic information. Keep disabled in normal
+#       play to avoid log noise.
+#       Default: 0 (disabled)
+#
+LLMChatter.DebugLog = 0
+
+#
+#   LLMChatter.MultiBotCompat.Enable
+#       Enable a small fallback compatibility handler for installs
+#       without mod-multibot-bridge. When enabled, mod-llm-chatter
+#       answers the MultiBot-Chatless startup handshake, ping,
+#       roster, state, and detail MBOT requests.
+#       Leave disabled when mod-multibot-bridge is installed; the
+#       bridge owns the MBOT protocol. mod-llm-chatter still suppresses
+#       its own debug-log noise for MBOT addon traffic when disabled.
+#       Disabled means mod-llm-chatter will not consume or block the
+#       addon's hidden MBOT communication.
+#       Default: 0 (disabled)
+#       [SERVER]
+#
+LLMChatter.MultiBotCompat.Enable = 0
+
+#
+#   LLMChatter.HealthCheck.Enable
+#       Run a startup preflight diagnostic in the bridge.
+#       It checks the config, DB connection, required tables,
+#       and the LLM provider/key, prints a PASS/FAIL report to
+#       the bridge logs, and loud-exits if a critical problem
+#       would stop bots from chatting (wrong DB credentials,
+#       missing/placeholder API key, unreachable LLM endpoint).
+#       You can also run it standalone:
+#         python chatter_healthcheck.py --config <conf>
+#         python chatter_healthcheck.py --config <conf> --serve
+#       Default: 1 (enabled)
+#       [BRIDGE]
+#
+LLMChatter.HealthCheck.Enable = 1
+
+#
+#   LLMChatter.HealthCheck.LLMProbe
+#       During the startup preflight, make one tiny live LLM
+#       test call to verify the API key / endpoint actually
+#       work. Disable to skip the live call (saves a few
+#       tokens, but configuration errors are caught later).
+#       Default: 1 (enabled)
+#       [BRIDGE]
+#
+LLMChatter.HealthCheck.LLMProbe = 1
+
+#
+#   LLMChatter.HealthCheck.LogPath
+#       Where the startup preflight also writes its PASS/FAIL
+#       report as a plain-text file (in addition to the bridge
+#       logs), so you can open it directly without scraping
+#       container logs. Overwritten on every startup.
+#       Leave empty to derive it from LLMChatter.RequestLog.Path's
+#       directory (e.g. /logs/healthcheck.log). For Docker users
+#       /logs is the bind mount, so the file appears on the host
+#       at modules/mod-llm-chatter/logs/healthcheck.log. Non-Docker
+#       users get the file wherever this directory points, as long
+#       as it is writable.
+#       Default: (empty -> <RequestLog dir>/healthcheck.log)
+#       [BRIDGE]
+#
+LLMChatter.HealthCheck.LogPath =
+
+#
+#   LLMChatter.RequestLog.Enable
+#       Log every LLM API call (prompt, response,
+#       timing) to a JSONL file for offline analysis.
+#       Default: 0 (disabled)
+#       [BRIDGE]
+#
+LLMChatter.RequestLog.Enable = 0
+
+#
+#   LLMChatter.RequestLog.Path
+#       Absolute path to the JSONL log file. The
+#       directory is created automatically on startup.
+#       Default: /logs/llm_requests.jsonl
+#       [BRIDGE]
+#
+LLMChatter.RequestLog.Path = /logs/llm_requests.jsonl
+
+#
+#   LLMChatter.RequestLog.MaxSizeMB
+#       Maximum log file size in megabytes. When the
+#       file exceeds this, it is rotated: renamed to
+#       .1.jsonl and a fresh file is started.
+#       Default: 50
+#       [BRIDGE]
+#
+LLMChatter.RequestLog.MaxSizeMB = 50
+
+###############################################################################
+# LLM PROVIDER SETTINGS [BRIDGE]
+###############################################################################
+#
+#   LLMChatter.StructuredOutput.Enable
+#       Request native JSON Schema output for all runtime JSON generation,
+#       including quick analysis, memory and host screenshot vision.
+#       0 = existing prompt/parser behavior; 1 = require validated schema output.
+#       Enable only when every configured JSON target supports this format.
+#       Unsupported endpoints must use 0; no automatic downgrade is performed.
+#       Local Ollama support depends on the server/model; Qwen is not an API.
+#       Install updated tools/requirements.txt before enabling. Restart the
+#       chatter bridge and host screenshot agent to load changes, not worldserver.
+#       Default: 0
+#       [BRIDGE / HOST SCREENSHOT AGENT]
+#
+LLMChatter.StructuredOutput.Enable = 0
+
+#
+# To switch providers, just change LLMChatter.Provider and LLMChatter.Model.
+# Only configure the settings for your chosen provider.
+# The bridge selects a safe parameter profile for the model and learns from
+# explicit unsupported-parameter errors, so stale model-specific options do
+# not need to be removed during ordinary switches.
+# Restart the chatter bridge after changing any setting in this section.
+#
+# VALUE FORMAT:
+#   - Write one setting per line as: Key = value
+#   - Do not wrap values in quotes. Quotes become part of the value.
+#   - Keep comments on their own lines; do not append them after a value.
+#   - Leave an optional setting empty as: Key =
+#   - Use 0 or 1 for switches, plain numbers for numeric values, and a dot for
+#     decimals (for example: 1.5). Do not add commas, units, or percent signs.
+#   - Copy model IDs exactly. OpenRouter uses vendor/model; Ollama uses the
+#     name and optional tag shown by `ollama list`.
+#
+# QUICK SETUP EXAMPLES:
+#
+#   Cloud (Anthropic Claude Haiku - recommended for quality):
+#     LLMChatter.Provider = anthropic
+#     LLMChatter.Model = claude-haiku-4-5-20251001
+#     LLMChatter.Anthropic.ApiKey = sk-ant-xxxxx
+#
+#   Cloud (OpenAI GPT-5.6 Luna - fast, low-cost reasoning model):
+#     LLMChatter.Provider = openai
+#     LLMChatter.Model = gpt-5.6-luna
+#     LLMChatter.OpenAI.ApiKey = sk-xxxxx
+#     LLMChatter.OpenAI.ReasoningEffort = none
+#
+#   Cloud (Google Gemini Flash):
+#     LLMChatter.Provider = google
+#     LLMChatter.Model = gemini-3.1-flash-lite
+#     LLMChatter.Google.ApiKey = AIza-xxxxx
+#
+#   Cloud (OpenRouter, OpenAI-compatible):
+#     LLMChatter.Provider = openrouter
+#     LLMChatter.Model = openai/gpt-4o-mini
+#     LLMChatter.OpenRouter.ApiKey = sk-or-v1-xxxxx
+#
+#   Ollama cloud (fast, pay-per-use via Ollama):
+#     LLMChatter.Provider = ollama
+#     LLMChatter.Model = deepseek-v3.1:671b-cloud
+#     (requires Ollama account with cloud access)
+#
+#   Ollama local (NOT RECOMMENDED unless you have fast inference hardware):
+#     LLMChatter.Provider = ollama
+#     LLMChatter.Model = qwen3:4b-instruct
+#     (install Ollama, run: ollama pull qwen3:4b-instruct)
+#     Running local models on consumer hardware or typical local network setups
+#     will result in severely degraded performance. Only use local Ollama if you
+#     have dedicated GPU inference hardware capable of sub-5s response times.
+#
+###############################################################################
+
+#
+#   LLMChatter.Provider
+#       Which LLM provider to use:
+#       Format: one lowercase name with no quotes.
+#       Values: anthropic, openai, google, openrouter, or ollama
+#       Default: anthropic
+#
+LLMChatter.Provider = anthropic
+
+#
+#   LLMChatter.Model
+#       Exact model ID to use with the selected provider. Do not use a display
+#       name, add quotes, or add a provider prefix except for OpenRouter.
+#
+#       Anthropic models:
+#         claude-haiku-4-5-20251001 (fast, cheap)
+#         claude-sonnet-4-5-20250929 (balanced)
+#         claude-opus-4-6 (highest quality)
+#
+#       OpenAI models:
+#         gpt-5.6-luna (fast, low cost, reasoning configurable)
+#         gpt-4o-mini (fast, cheap)
+#         gpt-4o (balanced)
+#
+#       Google Gemini models:
+#         gemini-3.1-flash-lite (fastest, cheap, tested)
+#         gemini-2.5-flash (fast, cheap)
+#         gemini-3-flash-preview (frontier Flash preview)
+#         Alias accepted: gemini-3-flash
+#
+#       OpenRouter models:
+#         anthropic/claude-haiku-4.5
+#         openai/gpt-4o-mini
+#         openrouter/auto
+#
+#       Ollama models (from 'ollama list'):
+#         qwen3:4b, qwen3:8b, llama3.2:3b
+#
+#       Default: claude-haiku-4-5-20251001
+#
+LLMChatter.Model = claude-haiku-4-5-20251001
+
+###############################################################################
+# ANTHROPIC SETTINGS [BRIDGE] (only needed if Provider = anthropic)
+###############################################################################
+
+#
+#   LLMChatter.Anthropic.ApiKey
+#       Format: the complete key as one unquoted value (starts with sk-ant-).
+#       Get one at: https://console.anthropic.com/
+#
+LLMChatter.Anthropic.ApiKey =
+
+###############################################################################
+# OPENAI SETTINGS [BRIDGE] (only needed if Provider = openai)
+###############################################################################
+
+#
+#   LLMChatter.OpenAI.ApiKey
+#       Format: the complete key as one unquoted value (starts with sk-).
+#       Get one at: https://platform.openai.com/api-keys
+#
+LLMChatter.OpenAI.ApiKey =
+
+#
+#   LLMChatter.OpenAI.ReasoningEffort
+#       Reasoning effort for modern OpenAI models.
+#       Format: none, low, medium, high, xhigh, or max; support varies by
+#       model. Leave empty for the model default.
+#       Use "none" for low-latency, short-form chatter.
+#       Ignored for non-reasoning models. If a reasoning model rejects the
+#       selected value, the bridge retries safely without it and remembers
+#       that correction for the rest of the process.
+#       Default: (empty)
+#
+LLMChatter.OpenAI.ReasoningEffort =
+
+#
+#   LLMChatter.OpenAI.MaxTokensMultiplier
+#       Multiplies per-call output budgets when an OpenAI reasoning model
+#       can spend tokens on hidden reasoning. It is not applied when the
+#       selected model supports and uses ReasoningEffort = none.
+#       Format: a number from 1 through 8, for example 4 or 1.5.
+#       Values outside that range are clamped by the bridge.
+#       Default: 4
+#
+LLMChatter.OpenAI.MaxTokensMultiplier = 4
+
+###############################################################################
+# GOOGLE SETTINGS [BRIDGE] (only needed if Provider = google)
+###############################################################################
+
+#
+#   LLMChatter.Google.ApiKey
+#       Format: the complete API key as one unquoted value.
+#       Get one at: https://aistudio.google.com/app/apikey
+#
+LLMChatter.Google.ApiKey =
+
+#
+#   LLMChatter.Google.BaseUrl
+#       Google Gemini OpenAI-compatible endpoint.
+#       Format: a complete http:// or https:// URL.
+#       Only change this if Google changes the compatibility endpoint.
+#
+LLMChatter.Google.BaseUrl = https://generativelanguage.googleapis.com/v1beta/openai/
+
+#
+#   LLMChatter.Google.ReasoningEffort
+#       Gemini reasoning effort for the OpenAI-compatible API.
+#       Used only when Google.ThinkingBudget is empty.
+#       Format: a lowercase effort name supported by the selected model.
+#       Recommended for Gemini 3.1 Flash-Lite: "minimal".
+#       Set empty or "off" to omit the parameter.
+#
+LLMChatter.Google.ReasoningEffort = minimal
+
+#
+#   LLMChatter.Google.ThinkingBudget
+#       Gemini thinking token budget for the OpenAI-compatible API.
+#       Format: a whole number with no commas or suffix, for example 0.
+#       For Gemini 2.5 Flash, set this to 0 to disable thinking for
+#       fast structured chatter and pre-cache calls.
+#       Set empty to use ReasoningEffort instead.
+#
+LLMChatter.Google.ThinkingBudget =
+
+#
+#   LLMChatter.Google.MaxTokensMultiplier
+#       Multiplies per-call output token budgets for Gemini.
+#       Format: a number from 1 through 8, for example 2 or 1.5.
+#       Values outside that range are clamped by the bridge.
+#       This protects short JSON paths such as pre-cache from
+#       returning empty/truncated content.
+#       Default: 2
+#
+LLMChatter.Google.MaxTokensMultiplier = 2
+
+###############################################################################
+# OPENROUTER SETTINGS [BRIDGE] (only needed if Provider = openrouter)
+###############################################################################
+
+#
+#   LLMChatter.OpenRouter.ApiKey
+#       Format: the complete key as one unquoted value (normally sk-or-v1-...).
+#       Get one at: https://openrouter.ai/keys
+#
+LLMChatter.OpenRouter.ApiKey =
+
+#
+#   LLMChatter.OpenRouter.BaseUrl
+#       OpenRouter OpenAI-compatible endpoint.
+#       Format: a complete http:// or https:// URL; normally leave unchanged.
+#       Only change this if OpenRouter changes the compatibility endpoint.
+#
+LLMChatter.OpenRouter.BaseUrl = https://openrouter.ai/api/v1
+
+#
+#   LLMChatter.OpenRouter.ReasoningEffort
+#       Optional OpenRouter reasoning effort. Leave empty to omit the
+#       reasoning object and preserve the model's default behavior.
+#       Set to "none" to explicitly disable reasoning on hybrid models.
+#       Other values are passed through without validation because
+#       supported efforts vary by model (for example: low, high, xhigh).
+#       Format: an unquoted effort name supported by the routed model.
+#
+LLMChatter.OpenRouter.ReasoningEffort =
+
+#
+#   LLMChatter.OpenRouter.ReasoningExclude
+#       When 1 and ReasoningEffort is set, asks OpenRouter not to return
+#       reasoning text. This does not reduce reasoning-token usage or cost.
+#       Format: 0 (include/default) or 1 (exclude).
+#       Default: 0
+#
+LLMChatter.OpenRouter.ReasoningExclude = 0
+
+#
+#   LLMChatter.OpenRouter.MaxTokensMultiplier
+#       Multiplies per-call output budgets only while reasoning is enabled.
+#       Reasoning tokens share the output budget, so values above 1 can
+#       prevent empty or truncated chatter at higher reasoning efforts.
+#       A value of 5 is a useful starting point for effort "high".
+#       Format: a number such as 2 or 1.5; no suffix or units.
+#       Clamped to the range 1-8. Default: 1
+#
+LLMChatter.OpenRouter.MaxTokensMultiplier = 1
+
+#
+#   LLMChatter.OpenRouter.HttpReferer
+#       Optional site URL for OpenRouter attribution/rankings.
+#       Format: a complete http:// or https:// URL, or empty to omit it.
+#       Leave empty if you do not want to send this header.
+#
+LLMChatter.OpenRouter.HttpReferer =
+
+#
+#   LLMChatter.OpenRouter.Title
+#       Optional app/site title for OpenRouter attribution/rankings.
+#       Format: plain unquoted text, or empty to omit it.
+#       Leave empty if you do not want to send this header.
+#
+LLMChatter.OpenRouter.Title =
+
+###############################################################################
+# OLLAMA SETTINGS [BRIDGE] (only needed if Provider = ollama)
+###############################################################################
+#
+# Ollama runs models locally on your machine - no API key needed!
+# Install: https://ollama.ai
+# Pull a model: ollama pull qwen3:4b
+#
+
+#
+#   LLMChatter.Ollama.BaseUrl
+#       Ollama API endpoint.
+#       Format: http://host:port without /v1 and without quotes.
+#       NOTE: If the chatter bridge runs in Docker and Ollama runs on the
+#       host machine, use http://host.docker.internal:11434 instead of
+#       localhost. "localhost" inside a container refers to the container
+#       itself, not the host.
+#       Default: http://localhost:11434
+#
+LLMChatter.Ollama.BaseUrl = http://host.docker.internal:11434
+
+#
+#   Ollama context size is controlled by the Ollama server, not by its
+#   OpenAI-compatible API. Set OLLAMA_CONTEXT_LENGTH before starting Ollama,
+#   or create a model with PARAMETER num_ctx in a Modelfile. Run `ollama ps`
+#   to verify the context actually loaded.
+
+#
+#   LLMChatter.Ollama.DisableThinking
+#       Some models like Qwen3 have "thinking" mode enabled by default,
+#       which adds internal reasoning before responding. This makes responses
+#       slower and uses more resources - overkill for simple chatter.
+#       Set to 1 to request reasoning_effort = none and add /no_think as a
+#       model-level fallback (recommended for Qwen3).
+#       Format: 0 (allow model thinking) or 1 (disable thinking).
+#       Default: 1
+#
+LLMChatter.Ollama.DisableThinking = 1
+
+###############################################################################
+# DATABASE SETTINGS [BRIDGE]
+###############################################################################
+
+#
+#   LLMChatter.Database.Host
+#       Database server hostname
+#       Default: localhost
+#
+LLMChatter.Database.Host = localhost
+
+#
+#   LLMChatter.Database.Port
+#       Database server port
+#       Default: 3306
+#
+LLMChatter.Database.Port = 3306
+
+#
+#   LLMChatter.Database.User
+#       Database username
+#       Default: acore
+#
+LLMChatter.Database.User =
+
+#
+#   LLMChatter.Database.Password
+#       Database password
+#       Default: acore
+#
+LLMChatter.Database.Password =
+
+#
+#   LLMChatter.Database.Name
+#       Characters database name
+#       Default: acore_characters
+#
+LLMChatter.Database.Name = acore_characters
+
+###############################################################################
+# FEATURE TOGGLES & BEHAVIOR TUNING [BOTH]
+#
+#   Enable or disable major features and tune how chatty bots feel.
+#
+###############################################################################
+
+#
+#   LLMChatter.ChatterMode
+#       Controls the personality style of bot chat messages
+#       "normal"   - Natural WoW player chat with a friendly, respectful
+#                    baseline
+#       "roleplay" - Fully in-character race/class personality with
+#                    lore-influenced speech
+#       Actual NPCs remain in character in either mode
+#       Default: normal
+#
+LLMChatter.ChatterMode = roleplay
+
+#
+#   LLMChatter.Language [BRIDGE]
+#       Language the LLM should use when generating bot chat.
+#       WoW proper nouns (zone, creature, item, spell, quest,
+#       and character names) are always kept in English so
+#       in-game references still match client data.
+#       Accepted values:
+#           GB / US - English (default, no extra instruction)
+#           FR      - French
+#           DE      - German
+#           ES      - Spanish
+#           KO      - Korean
+#           PT      - Portuguese
+#           RU      - Russian
+#       Adding a new language:
+#           Edit modules/mod-llm-chatter/tools/chatter_shared.py
+#           and add an entry to the _LANGUAGE_LABELS dict
+#           (search for "_LANGUAGE_LABELS"). The key is the
+#           code used here; the value is the English name
+#           injected into the LLM prompt. Examples:
+#               "IT": "Italian"
+#               "NL": "Dutch"
+#               "PL": "Polish"
+#           No other code changes needed — the prompt
+#           pipeline is language-agnostic. After adding the
+#           code, you may also want to bump
+#           LLMChatter.ProximityChatter.MaxTokensPerLine if
+#           the language tokenizes significantly larger than
+#           English (French/German/Spanish need ~80-100;
+#           Russian/Korean/Chinese/Japanese can need 150+).
+#       Changes require a bridge restart
+#       (docker restart ac-llm-chatter-bridge).
+#       Default: GB
+#
+LLMChatter.Language = GB
+
+#
+#   LLMChatter.GroupChatter.Enable
+#       Enable group chatter when bots are grouped with real players.
+#       Bots will react in party chat to events like kills, deaths,
+#       loot drops, player messages, and idle downtime.
+#       Default: 1 (enabled)
+#
+LLMChatter.GroupChatter.Enable = 1
+
+#
+#   LLMChatter.ChatHistoryLimit [BRIDGE]
+#       Maximum number of recent Party transcript lines included in
+#       prompts and player-message analysis. Valid range: 1-50.
+#       Higher values preserve more short-term context but consume more
+#       prompt tokens. General chat uses this value only as a fallback
+#       when GeneralChat.HistoryLimit is absent.
+#       Changes require a bridge restart.
+#       Default: 10
+#
+LLMChatter.ChatHistoryLimit = 10
+
+#
+#   LLMChatter.GeneralChannel.Enable
+#       Master switch for ALL General-channel chatter. When 0, bots
+#       produce nothing in the General channel: no ambient chatter
+#       (TriggerChance), no world-event reactions (weather, holidays,
+#       day/night, transports, minor events — including the ones that
+#       normally always fire), and no replies to player messages.
+#       Set this to 0 to silence the General channel completely with a
+#       single value. Leave at 1 to use the finer-grained toggles below.
+#       Default: 1
+#
+LLMChatter.GeneralChannel.Enable = 1
+
+#
+#   LLMChatter.GeneralChat.PlayerReplyEnable
+#       Enable bot reactions/replies to PLAYER messages in the General
+#       channel. This only governs responses to what players type; it
+#       does not affect ambient chatter or world-event reactions. To
+#       turn off everything in General at once, use
+#       LLMChatter.GeneralChannel.Enable above instead.
+#       Default: 1
+#
+LLMChatter.GeneralChat.PlayerReplyEnable = 1
+
+#
+#   LLMChatter.GeneralChat.HistoryLimit [BOTH]
+#       Maximum number of recent General lines retained per zone across
+#       both factions. Prompt reads are filtered to the reader's faction.
+#       Valid range: 1-50.
+#       Higher values preserve more short-term context but consume more
+#       prompt tokens. If this key is absent, ChatHistoryLimit is used.
+#       Changes require a bridge restart. The bridge also prunes this
+#       table, so reload the server config and restart the bridge together.
+#       Default: 15
+#
+LLMChatter.GeneralChat.HistoryLimit = 15
+
+#
+#   LLMChatter.PlayerChat.OptionalCasualReplyChance [BRIDGE]
+#       Reply chance (0-100) after semantic analysis decides that a
+#       brief casual player turn can naturally be left unanswered.
+#       Applies to Guild, General, proximity speech, and directed boss
+#       speech. Party messages always continue to response generation
+#       once queued, while still using brief-casual classification to
+#       keep lightweight replies concise. This setting does not suppress
+#       questions, requests, warnings, or other turns that clearly expect
+#       a response. Set to 100 to preserve guaranteed replies for the
+#       channels governed by this setting.
+#       Default: 20
+#
+LLMChatter.PlayerChat.OptionalCasualReplyChance = 20
+
+#
+#   LLMChatter.PlayerChat.BriefCasualLengthWeights [BRIDGE]
+#       Relative weights for the length of a reply to a brief casual
+#       player message in General, as three numbers:
+#       tiny (1-4 words), short (2-8 words), relaxed (5-14 words).
+#       Each reply picks one, and a second bot answering the same
+#       message picks a different size, so brief replies stay brief
+#       without all coming out the same length. Use 0,100,0 for the
+#       previous fixed 2-8 word replies.
+#       Default: 35,45,20
+#
+LLMChatter.PlayerChat.BriefCasualLengthWeights = 35,45,20
+
+#
+#   LLMChatter.PlayerChat.IgnoredPrefixes [SERVER]
+#       Comma-separated literal prefixes for player-authored Party,
+#       General, Guild, and /say messages that Chatter must ignore.
+#       Matching ignores leading whitespace and ASCII letter case. A
+#       matching message is ignored by Chatter before chat history,
+#       cooldown, session, or LLM event processing. Existing addon and
+#       Playerbot command filters remain active independently.
+#       This is only for protocols sent through visible player chat. Normal
+#       SendAddonMessage prefixes already arrive as LANG_ADDON and are
+#       ignored separately. Leave empty unless your server has a known
+#       visible-chat or admin-command prefix. Avoid ordinary words because
+#       every message starting with a configured value is suppressed.
+#       Entries are trimmed, so trailing spaces cannot be used to require a
+#       word boundary or separator; include punctuation instead.
+#       Changes take effect after `.reload config`.
+#       Default: empty (disabled)
+#
+LLMChatter.PlayerChat.IgnoredPrefixes =
+
+#
+#   LLMChatter.BGChatter.Enable
+#       Enable BG-specific chatter (flag events, node captures, match
+#       start/end, PvP kills, score milestones).
+#       Default: 1
+#
+LLMChatter.BGChatter.Enable = 1
+
+# Chance (0-100) per AB batch attempt; legacy per-node chance for EY.
+# AB observes every BG update; failed rolls retain pending facts until expiry.
+# 0 disables node reactions.
+LLMChatter.BGChatter.NodeEventChance = 80
+
+# Chance (0-100) for score milestone reactions; 0 disables these reactions.
+LLMChatter.BGChatter.ScoreMilestoneChance = 80
+
+# Milliseconds between legacy BG polls and AB pending-node speech attempts.
+# AB node observation runs every update regardless of this setting.
+# 0 evaluates speech every update; it does not provide stronger evidence.
+LLMChatter.BGChatter.StatePollingIntervalMs = 3000
+
+# Legacy shared big-event cooldown; AB node/score attempts are independent.
+# 0 disables this legacy cooldown.
+LLMChatter.BGChatter.BigEventCooldownSec = 15
+
+# Maximum actual gap (ms) for sampled AB transition labels. BG updates run
+# about once per second; 2000 tolerates ordinary scheduling jitter.
+# Larger gaps or multiple pending changes use state-only wording.
+# 0 disables transition labels. This does not change speech frequency.
+LLMChatter.BGChatter.AB.TransitionMaxGapMs = 2000
+
+# Enable AB node/resource observation, reactions and objective snapshots.
+# Disabling clears AB state; re-enable seeds silently. Other BGs are unchanged.
+LLMChatter.BGChatter.AB.Enable = 1
+
+# Maximum uncertainty of internal contest estimates, in seconds (0-60).
+# 0 omits estimates. These use the BG timer clock, not a wall-clock ETA.
+# Numerical timer wording remains disabled.
+LLMChatter.BGChatter.AB.TimerEstimateMaxUncertaintySec = 3
+
+# Maximum age in seconds at final BG delivery (clamped to 1-300).
+# These cannot disable match/audience validation. 0 is clamped to 1.
+# Match-end has its own limit and is allowed only during WAIT_LEAVE.
+LLMChatter.BGChatter.FactualMaxAgeSec = 30
+LLMChatter.BGChatter.AB.FactualMaxAgeSec = 15
+## AB node batches: attempt spacing and pending expiry clamp to 1-300 sec.
+## Chance failures consume the interval but retain current pending facts.
+LLMChatter.BGChatter.AB.NodeBatchCooldownSec = 15
+LLMChatter.BGChatter.AB.PendingMaxAgeSec = 30
+## Maximum referenced nodes in one reaction, clamped to 1-5.
+LLMChatter.BGChatter.AB.MaxNodesPerBatch = 3
+## Percentages 1-99; sorted/deduplicated. Any invalid list uses 30,60,90.
+## Rounded up against the verified target; core warning wins collisions.
+LLMChatter.BGChatter.AB.ScoreMilestonePercents = "30,60,90"
+## Score attempt interval, clamped 1-300 sec. Uses ScoreMilestoneChance.
+LLMChatter.BGChatter.AB.ScoreCooldownSec = 30
+## Replace an idle opportunity with objective status. Zero disables status;
+## positive intervals clamp to 1-3600 sec; chance clamps to 0-100.
+LLMChatter.BGChatter.AB.ObjectiveStatusIntervalSec = 60
+LLMChatter.BGChatter.AB.ObjectiveStatusChance = 50
+LLMChatter.BGChatter.MatchEndMaxAgeSec = 45
+
+#
+#   LLMChatter.RaidChatter.Enable
+#       Enable PvE raid boss chatter (pull, kill, wipe reactions).
+#       Default: 1
+#
+LLMChatter.RaidChatter.Enable = 1
+
+#
+#   LLMChatter.ZoneIntrusion.Enable
+#       Enable defending-faction bots yelling when an enemy
+#       player enters a faction-owned zone.
+#       Default: 1
+#
+LLMChatter.ZoneIntrusion.Enable = 1
+
+#
+#   LLMChatter.GroupChatter.PreCacheEnable
+#       Master toggle for pre-cached instant reactions.
+#       When enabled, combat-time reactions are served
+#       from a pre-generated cache for instant delivery.
+#       Default: 1 (enabled)
+#
+LLMChatter.GroupChatter.PreCacheEnable = 1
+
+###############################################################################
+# AMBIENT / WORLD EVENT TUNING [SERVER]
+#
+#   Two systems drive General channel chatter:
+#
+#   1. AMBIENT CHATTER (TriggerChance)
+#      Unprompted conversations — bots spontaneously talk in General
+#      about their surroundings, lore, mood, or whatever comes to mind.
+#      Checked every ~60 seconds per zone. Boosted in capital cities.
+#
+#   2. WORLD EVENT REACTIONS (EventReactionChance)
+#      Bots react in General to things happening in the world:
+#      - Weather changes (rain starting, snow clearing, fog rolling in)
+#      - Transport arrivals (boats and zeppelins entering a zone)
+#      - Holidays (Brewfest, Hallow's End, Love is in the Air, etc.)
+#      - Day/night transitions (dawn, dusk, midnight)
+#      - Minor events (Call to Arms BG rotations, fishing derbies)
+#
+#      Some events always trigger (holidays, day/night, weather changes).
+#      Others roll against EventReactionChance or their own override.
+#
+###############################################################################
+
+#
+#   LLMChatter.TriggerIntervalSeconds
+#       How often (in seconds) the server checks each zone for
+#       ambient General channel chatter. Each check rolls
+#       TriggerChance per zone. Lower = more frequent checks.
+#       Default: 30
+#
+LLMChatter.TriggerIntervalSeconds = 30
+
+#
+#   LLMChatter.TriggerChance
+#       Chance (0-100) per zone per interval that ambient General
+#       channel chatter fires. Bots talk unprompted about their
+#       surroundings, lore, or mood. Doubled in capital cities
+#       (via internal CityChatterMultiplier).
+#       Default: 15
+#
+LLMChatter.TriggerChance = 15
+
+#
+#   LLMChatter.ConversationChance
+#       Chance (0-100) that ambient General channel chatter
+#       is a multi-bot conversation instead of a single
+#       statement. Requires 2+ bots in the zone.
+#       Default: 40
+#
+LLMChatter.ConversationChance = 50
+
+#
+#   LLMChatter.AmbientNpcGossipChance
+#       Additive chance (0-100) that an ambient General channel
+#       message uses the NPC gossip subject type before falling
+#       back to the regular plain/quest/loot/trade/spell mix.
+#       If no suitable zone NPC is found, the message falls back
+#       to plain ambient chatter.
+#       Default: 5
+#
+LLMChatter.AmbientNpcGossipChance = 5
+
+#
+#   LLMChatter.AmbientBotGossipChance
+#       Additive chance (0-100) that an ambient General channel
+#       message uses the bot gossip subject type before falling
+#       back to the regular plain/quest/loot/trade/spell mix.
+#       The selected target is an online random bot in the zone,
+#       excluding the speakers. If none is found, falls back to
+#       plain ambient chatter.
+#       Default: 5
+#
+LLMChatter.AmbientBotGossipChance = 5
+
+#
+#   LLMChatter.AmbientGossipTargetCooldownSeconds
+#       Minimum time before the same NPC or bot can be selected
+#       again as an ambient gossip subject in the same zone.
+#       Prevents repeated gossip about the same subject when
+#       NPC/bot gossip chances are raised for testing.
+#       Set to 0 to disable.
+#       Default: 1800
+#
+LLMChatter.AmbientGossipTargetCooldownSeconds = 1800
+
+#
+#   LLMChatter.AmbientTrade.QualityWeightBonus
+#       Additional selection weight per item-quality tier above common
+#       when choosing a real item from an ambient seller's inventory.
+#       Common items always have weight 1. With the default value,
+#       uncommon/rare/epic items have weights 5/9/13. Set to 0 for
+#       uniform selection across eligible inventory slots.
+#       Default: 4
+#
+LLMChatter.AmbientTrade.QualityWeightBonus = 4
+
+#
+#   LLMChatter.GeneralLoot.Enable
+#       Enable occasional General-channel messages grounded in items
+#       that ungrouped playerbots actually loot in a real player's
+#       outdoor zone.
+#       Default: 1
+#
+LLMChatter.GeneralLoot.Enable = 1
+
+#
+#   LLMChatter.GeneralLoot.AggregationDelayMilliseconds
+#       Quiet period used to combine several item callbacks from one
+#       loot source before one actual item is selected uniformly.
+#       Default: 2500
+#
+LLMChatter.GeneralLoot.AggregationDelayMilliseconds = 2500
+
+#
+#   LLMChatter.GeneralLoot.ZoneCooldownSeconds
+#       Minimum time between real bot-loot announcements in one zone.
+#       Set to 0 to disable this throttle for testing.
+#       Default: 180
+#
+LLMChatter.GeneralLoot.ZoneCooldownSeconds = 180
+
+#
+#   LLMChatter.GeneralLoot.MinQuality
+#       Minimum item quality eligible for General loot messages.
+#       0=poor, 1=common, 2=uncommon, 3=rare, 4=epic,
+#       5=legendary, 6=artifact, 7=heirloom.
+#       Default: 2
+#
+LLMChatter.GeneralLoot.MinQuality = 2
+
+#
+#   LLMChatter.EventReactionChance
+#       Base chance (0-100) that a world event triggers a General
+#       channel reaction. Real playerbot loot sources use one roll per
+#       source. Transport arrivals and weather ambient remarks also use
+#       this value. Holidays, day/night transitions, and weather changes
+#       always fire (bypass this roll). Transport and weather ambient
+#       have optional per-event overrides below.
+#       Default: 25
+#
+LLMChatter.EventReactionChance = 15
+
+#
+#   LLMChatter.EventConversationChance
+#       Chance (0-100) that a world event reaction becomes
+#       a multi-bot conversation instead of a single
+#       statement. Requires 2+ eligible bots.
+#       Default: 60
+#       [BRIDGE]
+#
+LLMChatter.EventConversationChance = 40
+
+#
+#   LLMChatter.WeatherAmbientChance
+#       Override chance for weather_ambient events (0 = use EventReactionChance)
+#       Default: 0
+#
+LLMChatter.WeatherAmbientChance = 0
+
+#
+#   LLMChatter.TransportEventChance
+#       Override chance for transport_arrives events (0 = use EventReactionChance)
+#       Default: 0
+#
+LLMChatter.TransportEventChance = 0
+
+#
+#   LLMChatter.TransportCooldownSeconds
+#       Cooldown per transport entry arrival event (seconds)
+#       Default: 600 (10 minutes)
+#
+LLMChatter.TransportCooldownSeconds = 600
+
+#
+#   LLMChatter.WeatherCooldownSeconds
+#       Cooldown per zone for weather transition events
+#       Default: 300 (5 minutes)
+#
+LLMChatter.WeatherCooldownSeconds = 300
+
+#
+#   LLMChatter.WeatherAmbientCooldownSeconds
+#       Cooldown per zone for ambient weather remarks
+#       Default: 120 (2 minutes)
+#
+LLMChatter.WeatherAmbientCooldownSeconds = 120
+
+#
+#   LLMChatter.DayNightCooldownSeconds
+#       Cooldown for day/night transition events
+#       Default: 7200 (2 hours)
+#
+LLMChatter.DayNightCooldownSeconds = 7200
+
+#
+#   LLMChatter.HolidayCooldownSeconds
+#       Per-city cooldown for recurring holiday mentions
+#       Default: 1800 (30 minutes)
+#
+LLMChatter.HolidayCooldownSeconds = 1800
+
+#
+#   LLMChatter.HolidayCityChance
+#       Chance (0-100) per environment check that a holiday
+#       mention triggers in a capital city.
+#       Default: 10
+#
+LLMChatter.HolidayCityChance = 20
+
+#
+#   LLMChatter.HolidayZoneChance
+#       Chance (0-100) per environment check that a holiday
+#       mention triggers in open-world zones.
+#       Default: 15
+#
+LLMChatter.HolidayZoneChance = 15
+
+#
+#   LLMChatter.Events.MinorEventChance
+#       Chance (0-100) that a minor game event triggers a
+#       General channel reaction. Minor events include:
+#       Call to Arms battleground rotations, fishing
+#       tournaments (Stranglethorn Fishing Extravaganza,
+#       Kalu'ak Derby), and seasonal fireworks.
+#       These are cyclic/recurring, so a low chance prevents
+#       repetitive chatter about the same event.
+#       Default: 20
+#
+LLMChatter.Events.MinorEventChance = 20
+
+###############################################################################
+# PROXIMITY CHATTER [BOTH]
+#
+#   Ambient /say and monster-say scenes around real players.
+#   Uses the event system, Python bridge, and C++ local delivery.
+#
+###############################################################################
+
+#
+#   LLMChatter.ProximityChatter.Enable
+#       Master toggle for proximity chatter.
+#       Default: 1
+#
+LLMChatter.ProximityChatter.Enable = 1
+
+#
+#   LLMChatter.ProximityChatter.EnableInDungeons
+#       Allow the existing proximity system to run inside
+#       dungeon maps. The master proximity toggle still wins.
+#       Default: 1
+#
+LLMChatter.ProximityChatter.EnableInDungeons = 1
+
+#
+#   LLMChatter.ProximityChatter.EnableInRaids
+#       Allow the existing proximity system to run inside
+#       raid maps. Battlegrounds and arenas stay excluded.
+#       The master proximity toggle still wins.
+#       Default: 1
+#
+LLMChatter.ProximityChatter.EnableInRaids = 1
+
+#
+#   LLMChatter.ProximityChatter.ScanIntervalSeconds
+#       Compatibility fallback for scoped scan intervals when an older
+#       config does not define the outdoor or instance setting below.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.ScanIntervalSeconds = 30
+
+#
+#   LLMChatter.ProximityChatter.OutdoorScanIntervalSeconds
+#       Seconds between ordinary proximity scans in outdoor maps.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.OutdoorScanIntervalSeconds = 30
+
+#
+#   LLMChatter.ProximityChatter.InstanceScanIntervalSeconds
+#       Seconds between ordinary proximity scans in dungeons and raids.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.InstanceScanIntervalSeconds = 30
+
+#
+#   LLMChatter.ProximityChatter.ScanRadius
+#       Detection radius in yards around the player.
+#       Must not exceed ListenRange.Say (default 40)
+#       or NPC speech will be inaudible.
+#       Default: 40
+#
+LLMChatter.ProximityChatter.ScanRadius = 40
+
+#
+#   LLMChatter.ProximityChatter.Chance
+#       Compatibility fallback for scoped chances when an older config
+#       does not define the outdoor or instance setting below.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.Chance = 100
+
+#
+#   LLMChatter.ProximityChatter.OutdoorChance
+#       Base chance (0-100) per eligible outdoor scan that an ordinary
+#       proximity scene is queued.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.OutdoorChance = 15
+
+#
+#   LLMChatter.ProximityChatter.InstanceChance
+#       Base chance (0-100) per eligible dungeon or raid scan that an
+#       ordinary proximity scene is queued. Instances use a higher
+#       default because combat and movement remove many opportunities.
+#       Default: 100
+#
+LLMChatter.ProximityChatter.InstanceChance = 50
+
+#
+#   LLMChatter.ProximityChatter.EntityCooldown
+#       Seconds before the same bot or NPC can be used
+#       again as the lead speaker.
+#       Clamped to 0-3 seconds for fluid local interaction.
+#       Default: 3
+#
+LLMChatter.ProximityChatter.EntityCooldown = 3
+
+#
+#   LLMChatter.ProximityChatter.ZoneFatigueThreshold
+#       Number of recent scenes around the same player /
+#       zone before chance decay starts.
+#       Default: 3
+#
+LLMChatter.ProximityChatter.ZoneFatigueThreshold = 3
+
+#
+#   LLMChatter.ProximityChatter.ZoneFatigueDecay
+#       Percent chance removed per scene after the
+#       fatigue threshold.
+#       Default: 20
+#
+LLMChatter.ProximityChatter.ZoneFatigueDecay = 20
+
+#
+#   LLMChatter.ProximityChatter.ConversationChance
+#       Chance (0-100) to generate a multi-speaker scene
+#       instead of a single line.
+#       Default: 40
+#
+LLMChatter.ProximityChatter.ConversationChance = 40
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.Enable [SERVER]
+#       Let bots outside the player's group react to a nearby duel or
+#       open-world PvP kill. Bots the player can read (same faction)
+#       use short proximity /say lines; opposite-faction bots only
+#       emote. Exactly one reaction per moment: a statement or a 2-3
+#       bot conversation. Immersion is a subtle balance: less is more.
+#       Fighters the reacting bots cannot see are never named.
+#       Default: 1
+#
+LLMChatter.ProximityChatter.FightReactions.Enable = 1
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.DuelChance [SERVER]
+#       Chance (0-100) that a selected duel moment gets a reaction.
+#       Scaled down by proximity zone fatigue.
+#       Default: 35
+#
+LLMChatter.ProximityChatter.FightReactions.DuelChance = 20
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.PvPChance [SERVER]
+#       Chance (0-100) that a nearby open-world PvP kill gets a
+#       reaction. Scaled down by proximity zone fatigue.
+#       Default: 25
+#
+LLMChatter.ProximityChatter.FightReactions.PvPChance = 15
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.ConversationChance [SERVER]
+#       Chance (0-100) that a reaction is a 2-3 bot conversation (or
+#       emote exchange) instead of a single statement.
+#       Default: 35
+#
+LLMChatter.ProximityChatter.FightReactions.ConversationChance = 25
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.SecondMomentChance [SERVER]
+#   LLMChatter.ProximityChatter.FightReactions.ThirdMomentChance [SERVER]
+#       Each duel gets one moment (before, during, or after). A second
+#       moment is added with SecondMomentChance, and a third with
+#       ThirdMomentChance only after a second. Defaults give 80% one,
+#       16% two, and 4% three moments.
+#       Default: 20 / 20
+#
+LLMChatter.ProximityChatter.FightReactions.SecondMomentChance = 20
+LLMChatter.ProximityChatter.FightReactions.ThirdMomentChance = 20
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.ChallengeDelaySeconds [SERVER]
+#       Seconds after a duel challenge before the "before" moment.
+#       Default: 2
+#
+LLMChatter.ProximityChatter.FightReactions.ChallengeDelaySeconds = 2
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.MidDelayMinSeconds [SERVER]
+#   LLMChatter.ProximityChatter.FightReactions.MidDelayMaxSeconds [SERVER]
+#       Random delay after a duel starts before the "during" moment.
+#       Default: 8 / 15
+#
+LLMChatter.ProximityChatter.FightReactions.MidDelayMinSeconds = 8
+LLMChatter.ProximityChatter.FightReactions.MidDelayMaxSeconds = 15
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.PendingExpirySeconds [SERVER]
+#       A due moment, kill scene, or emote step older than this is
+#       dropped instead of fired late.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.FightReactions.PendingExpirySeconds = 30
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.CompletedRetentionSeconds [SERVER]
+#       How long a finished duel stays valid for delivering its
+#       "after" lines (covers LLM and delivery latency).
+#       Default: 60
+#
+LLMChatter.ProximityChatter.FightReactions.CompletedRetentionSeconds = 60
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.LineMaxAgeSeconds [SERVER]
+#       Maximum age of a PvP kill reaction line at delivery.
+#       Default: 20
+#
+LLMChatter.ProximityChatter.FightReactions.LineMaxAgeSeconds = 20
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.SceneCooldownSeconds [SERVER]
+#       Minimum seconds between duel scenes for the same player in the
+#       same area, and between reactions to the same PvP kill scene.
+#       Later moments of the same duel are not affected.
+#       Default: 120
+#
+LLMChatter.ProximityChatter.FightReactions.SceneCooldownSeconds = 120
+
+#
+#   LLMChatter.ProximityChatter.FightReactions.SceneCellYards [SERVER]
+#       Size of the area cell used by SceneCooldownSeconds: repeated
+#       duels near the same player inside one cell count as one scene.
+#       Default: 100
+#
+LLMChatter.ProximityChatter.FightReactions.SceneCellYards = 100
+
+#
+#   LLMChatter.ProximityChatter.PlayerAddressChance
+#       Chance (0-100) for a single nearby line to be
+#       framed as if it might address the player.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.PlayerAddressChance = 30
+
+#
+#   LLMChatter.ProximityChatter.MaxConversationLines
+#       Maximum number of lines in an unsolicited
+#       proximity conversation.
+#       Default: 4
+#
+LLMChatter.ProximityChatter.MaxConversationLines = 4
+
+#
+#   LLMChatter.ProximityChatter.ConversationLineDelay
+#       Fixed seconds between lines when DynamicPacing.Enable = 0.
+#       Default: 2
+#
+LLMChatter.ProximityChatter.ConversationLineDelay = 8
+
+#
+#   LLMChatter.ProximityChatter.DynamicPacing.* [BRIDGE]
+#       Length-aware gaps between nearby conversation lines. The first
+#       line has no added delay. Reading and typing overlap: the longer
+#       of the previous and current visible lines sets the length term.
+#       MinSeconds + characters / CharsPerSecond sets the base gap,
+#       bounded by MaxSeconds, with JitterPercent variation inside bounds.
+#       Defaults: enabled, 3-8 seconds, 20 chars/sec, 20% variation.
+#       Set Enable = 0 to use ConversationLineDelay instead.
+#
+LLMChatter.ProximityChatter.DynamicPacing.Enable = 1
+LLMChatter.ProximityChatter.DynamicPacing.MinSeconds = 3
+LLMChatter.ProximityChatter.DynamicPacing.MaxSeconds = 8
+LLMChatter.ProximityChatter.DynamicPacing.CharsPerSecond = 20
+LLMChatter.ProximityChatter.DynamicPacing.JitterPercent = 20
+
+#
+#   LLMChatter.ProximityChatter.ReplyWindowSeconds
+#       How long a delivered scene stays eligible for a
+#       player /say reply.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.ReplyWindowSeconds = 30
+
+#
+#   LLMChatter.ProximityChatter.ReplyMaxTurns
+#       Maximum delivered turns tracked for a live
+#       proximity scene before replies stop.
+#       Default: 5
+#
+LLMChatter.ProximityChatter.ReplyMaxTurns = 5
+
+#
+#   LLMChatter.ProximityChatter.MaxTokensPerLine
+#       Response token budget per line. This is a
+#       hard ceiling, not a target — the prompt
+#       constrains the LLM to 8-15 words. The cap
+#       only needs to fit the JSON wrapper plus the
+#       longest plausible reply in the configured
+#       LLMChatter.Language. English fits in ~50
+#       tokens; French/German/Spanish need ~80-100
+#       because they tokenize ~30-50% larger. Set
+#       too low and responses truncate mid-sentence,
+#       producing unparseable JSON in chat.
+#       Default: 120
+#
+LLMChatter.ProximityChatter.MaxTokensPerLine = 120
+
+#
+#   LLMChatter.ProximityChatter.FacingResetDelay
+#       Seconds before an NPC speaker restores its
+#       original facing after an `msay` line.
+#       Default: 8
+#
+LLMChatter.ProximityChatter.FacingResetDelay = 8
+
+#
+#   LLMChatter.ProximityChatter.DirectedMaxExtraReactors
+#       Maximum nearby reactors that may join a directed player /say or
+#       emote interaction in addition to the addressed speaker. Range: 0-2.
+#       Default: 2
+#
+LLMChatter.ProximityChatter.DirectedMaxExtraReactors = 2
+
+#
+#   LLMChatter.ProximityChatter.DirectedBotMaxParticipants
+#       Maximum total AI entities in a direct interaction with an ungrouped
+#       playerbot, including a speaking or silent addressed bot. Range: 1-3.
+#       Default: 3
+#
+LLMChatter.ProximityChatter.DirectedBotMaxParticipants = 3
+
+#
+#   LLMChatter.ProximityChatter.DirectedExtraReactorWeights
+#       Comma-separated percentages for selecting 0, 1, 2, or 3 extra
+#       nearby reactors. The universal two-joiner cap keeps the final slot
+#       at zero. Values must strictly descend and total 100.
+#       Default: 60,30,10,0
+#
+LLMChatter.ProximityChatter.DirectedExtraReactorWeights = 60,30,10,0
+
+#
+#   LLMChatter.ProximityChatter.DirectedWitnessReactorWeights
+#       Comma-separated percentages for selecting 1 or 2 witnesses when
+#       an addressed playerbot stays silent after a directed emote.
+#       Values must strictly descend and total 100.
+#       Default: 70,30
+#
+LLMChatter.ProximityChatter.DirectedWitnessReactorWeights = 70,30
+
+#
+#   LLMChatter.ProximityChatter.DirectedNPCAsideChance
+#       When extra NPCs join, chance (0-100) that they discuss the
+#       player's real words or action with the addressed NPC without
+#       directly involving the player.
+#       Default: 35
+#
+LLMChatter.ProximityChatter.DirectedNPCAsideChance = 35
+
+#
+#   LLMChatter.ProximityChatter.DirectedMaxLines
+#       Maximum generated speaker lines in one directed interaction.
+#       Range: 1-8.
+#       Default: 5
+#
+LLMChatter.ProximityChatter.DirectedMaxLines = 5
+
+#
+#   LLMChatter.ProximityChatter.DirectedExpirySeconds
+#       Seconds before a queued directed interaction becomes too old
+#       to generate. Keeps replies relevant to the player's action.
+#       Default: 30
+#
+LLMChatter.ProximityChatter.DirectedExpirySeconds = 30
+
+#
+#   LLMChatter.ProximityChatter.DirectedNameStopwords
+#       Comma-separated title and place words that must not identify an
+#       NPC by themselves. Full NPC names still match. Matching is
+#       case-insensitive; an NPC's subname words are also excluded.
+#       Default: guard,city,mountaineer,innkeeper,vendor,trainer,
+#                quartermaster,merchant,stablemaster,banker,auctioneer,
+#                flight,master,officer,captain,stormwind,ironforge,
+#                orgrimmar,darnassus,undercity,silvermoon,exodar
+#
+LLMChatter.ProximityChatter.DirectedNameStopwords = guard,city,mountaineer,innkeeper,vendor,trainer,quartermaster,merchant,stablemaster,banker,auctioneer,flight,master,officer,captain,stormwind,ironforge,orgrimmar,darnassus,undercity,silvermoon,exodar
+
+#
+#   LLMChatter.ProximityChatter.PlayerSayScanRadius
+#       Detection radius (yards) when a player types
+#       /say and no active proximity scene exists.
+#       Matches the default WoW /say listen range.
+#       Default: 40
+#
+LLMChatter.ProximityChatter.PlayerSayScanRadius = 40
+
+#
+#   LLMChatter.ProximityChatter.SpeakerAllowEntries
+#       Comma-separated creature template entry IDs for ordinary
+#       non-humanoid speakers deliberately approved by the server owner.
+#       This does not override universal safety checks, the speaker
+#       denylist, or boss exclusion. Interactive quest, vendor, trainer,
+#       innkeeper, flight-master, and guard NPCs do not need to be listed.
+#       Invalid values are logged and ignored.
+#       Default: (empty)
+#
+LLMChatter.ProximityChatter.SpeakerAllowEntries =
+
+#
+#   LLMChatter.ProximityChatter.SpeakerDenyEntries
+#       Comma-separated creature template entry IDs that must never join
+#       ordinary proximity chatter. This wins over the allowlist and also
+#       applies to humanoids and interactive NPCs.
+#       Invalid values are logged and ignored.
+#       Default: (empty)
+#
+LLMChatter.ProximityChatter.SpeakerDenyEntries =
+
+#
+#   LLMChatter.ProximityChatter.EnableBossDialogue
+#       Allow hostile dungeon and raid bosses to deliver paced
+#       pre-aggro lines when a real player safely approaches or
+#       directly addresses them in /say. Bosses are deliberately
+#       separate from ordinary ambient proximity conversations.
+#       Keep disabled until the boss in-game matrix has been checked.
+#       Default: 0
+#
+LLMChatter.ProximityChatter.EnableBossDialogue = 1
+
+#
+#   LLMChatter.ProximityChatter.BossApproachCheckIntervalSeconds
+#       Interval between safe pre-aggro boss scan passes. Each pass
+#       checks one eligible real player in round-robin order, which
+#       caps creature-grid work in populated instances.
+#       Default: 2
+#
+LLMChatter.ProximityChatter.BossApproachCheckIntervalSeconds = 2
+
+#
+#   LLMChatter.ProximityChatter.BossApproachMaxRadius
+#       Maximum detection and yell-delivery radius in yards.
+#       This is intentionally larger than ordinary /say range so
+#       hostile bosses can speak before the player pulls them.
+#       Default: 80
+#
+LLMChatter.ProximityChatter.BossApproachMaxRadius = 80
+
+#
+#   LLMChatter.ProximityChatter.BossAggroSafetyMargin
+#       Additional yards required beyond the boss's calculated
+#       aggro distance before a generated line can be queued or
+#       delivered. Higher values reduce accidental pull overlap.
+#       Default: 0
+#
+LLMChatter.ProximityChatter.BossAggroSafetyMargin = 0
+
+#
+#   LLMChatter.ProximityChatter.BossInitialDelayMinSeconds
+#   LLMChatter.ProximityChatter.BossInitialDelayMaxSeconds
+#       Random delay before the guaranteed first automatic boss line
+#       during a new nearby presence.
+#       Defaults: 2, 6
+#
+LLMChatter.ProximityChatter.BossInitialDelayMinSeconds = 2
+LLMChatter.ProximityChatter.BossInitialDelayMaxSeconds = 6
+
+#
+#   LLMChatter.ProximityChatter.BossRepeatDelayMinSeconds
+#   LLMChatter.ProximityChatter.BossRepeatDelayMaxSeconds
+#       Random delay between later automatic speaking opportunities.
+#       A failed chance roll consumes the opportunity and schedules a
+#       new delay instead of rerolling every scan.
+#       Defaults: 20, 60
+#
+LLMChatter.ProximityChatter.BossRepeatDelayMinSeconds = 20
+LLMChatter.ProximityChatter.BossRepeatDelayMaxSeconds = 60
+
+#
+#   LLMChatter.ProximityChatter.BossRepeatChance
+#       Chance (0-100) that the second automatic opportunity produces
+#       a line. The first line is guaranteed.
+#       Default: 80
+#
+LLMChatter.ProximityChatter.BossRepeatChance = 80
+
+#
+#   LLMChatter.ProximityChatter.BossRepeatChanceDecayPercent
+#       Percentage of the previous repeat chance used for each later
+#       successful line. At the defaults, lines two through five use
+#       80%, 40%, 20%, and 10% chances.
+#       Default: 50
+#
+LLMChatter.ProximityChatter.BossRepeatChanceDecayPercent = 50
+
+#
+#   LLMChatter.ProximityChatter.BossRepeatChanceFloor
+#       Minimum chance (0-100) retained for later automatic speaking
+#       opportunities after decay. This keeps a boss capable of another
+#       occasional line throughout one long presence. BossRepeatChance = 0
+#       still disables all repeat lines.
+#       Default: 10
+#
+LLMChatter.ProximityChatter.BossRepeatChanceFloor = 10
+
+#
+#   LLMChatter.ProximityChatter.BossUnlimitedAutomaticLines
+#       Keep scheduling randomized automatic opportunities throughout one
+#       continuous nearby presence. Disable this only when the legacy hard
+#       cap below is desired.
+#       Default: 1
+#
+LLMChatter.ProximityChatter.BossUnlimitedAutomaticLines = 1
+
+#
+#   LLMChatter.ProximityChatter.BossMaxAutomaticLines
+#       Hard limit used only when BossUnlimitedAutomaticLines = 0.
+#       Set to 0 to disable automatic lines while retaining directly
+#       addressed boss replies.
+#       Default: 3
+#
+LLMChatter.ProximityChatter.BossMaxAutomaticLines = 3
+
+#
+#   LLMChatter.ProximityChatter.BossPresenceResetSeconds
+#       Seconds without an eligible nearby player before the boss-room
+#       presence resets. Automatic state is shared by boss spawn and
+#       instance, so additional real players do not multiply yells.
+#       Default: 90
+#
+LLMChatter.ProximityChatter.BossPresenceResetSeconds = 90
+
+#
+#   LLMChatter.ProximityChatter.BossDirectedReplyCooldownSeconds
+#       Minimum seconds between generated replies when the player
+#       explicitly names or targets a boss and speaks in /say.
+#       This is separate from the longer automatic approach cooldown.
+#       Clamped to 0-3 seconds so directed interaction stays responsive.
+#       Default: 3
+#
+LLMChatter.ProximityChatter.BossDirectedReplyCooldownSeconds = 3
+
+#
+#   LLMChatter.ProximityChatter.BossDirectedScanCooldownSeconds
+#       Minimum seconds between extended boss searches caused by
+#       /say for the same player, map, and instance. This bounds chat
+#       spam before a matching boss and reply cooldown can be known.
+#       During the throttle window, merely targeting a boss does not
+#       suppress unrelated ordinary proximity replies.
+#       Default: 1
+#
+LLMChatter.ProximityChatter.BossDirectedScanCooldownSeconds = 1
+
+#
+#   LLMChatter.ProximityChatter.BossSpeakerDenyEntries
+#       Comma-separated creature entry IDs which must never use
+#       generated boss dialogue. Use this for encounters whose
+#       scripted presentation would conflict with extra speech.
+#       Default: (empty)
+#
+LLMChatter.ProximityChatter.BossSpeakerDenyEntries =
+
+###############################################################################
+# GROUP CHATTER TUNING [SERVER]
+###############################################################################
+
+#
+#   LLMChatter.GroupChatter.IdleCheckInterval
+#       How often (in seconds) the bridge checks each group
+#       for idle chatter opportunities. Each check rolls
+#       IdleChance. Lower = more frequent checks.
+#       Default: 30
+#
+LLMChatter.GroupChatter.IdleCheckInterval = 30
+
+#
+#   LLMChatter.GroupChatter.IdleChance
+#       Percent chance (0-100) per check that bots start
+#       chatting during downtime.
+#       Default: 15
+#
+LLMChatter.GroupChatter.IdleChance = 7
+
+#
+#   LLMChatter.GroupChatter.ConversationBias
+#       Chance (0-100) that party idle chatter is a multi-bot
+#       conversation instead of a single statement. Requires
+#       2+ bots in the group.
+#       Default: 50
+#
+LLMChatter.GroupChatter.ConversationBias = 30
+
+#
+#   LLMChatter.GroupChatter.IdleCooldown
+#       Minimum seconds between idle chatter triggers
+#       for the same group.
+#       Default: 40
+#
+LLMChatter.GroupChatter.IdleCooldown = 40
+
+#
+#   LLMChatter.GroupChatter.KillChanceNormal
+#       Percent chance (0-100) that a normal mob kill
+#       triggers a group reaction.
+#       Boss and rare kills always trigger (100%).
+#       Default: 20
+#
+LLMChatter.GroupChatter.KillChanceNormal = 8
+
+#
+#   LLMChatter.GroupChatter.KillCooldown
+#       Minimum seconds between normal mob kill reactions
+#       for the same group. Controls how chatty combat feels.
+#       Boss/rare kills bypass this cooldown.
+#       Default: 120
+#
+LLMChatter.GroupChatter.KillCooldown = 120
+
+#
+#   LLMChatter.GroupChatter.KillBurstWindow [BRIDGE]
+#       Seconds after a kill reaction during which further non-boss
+#       kills in the same group stay silent. Stops a boss and its
+#       rare-flagged escorts from producing several near-identical
+#       lines in one fight. Boss kills always react and restart the
+#       window. 0 disables the guard.
+#       Default: 30
+#
+LLMChatter.GroupChatter.KillBurstWindow = 45
+
+#
+#   LLMChatter.GroupChatter.PullBurstWindow [BRIDGE]
+#       Seconds during which only one pull (battle cry) reaction is
+#       voiced per group. Every bot entering combat on the same pull
+#       raises its own event; the first speaks, the rest stay quiet.
+#       0 disables the guard.
+#       Default: 15
+#
+LLMChatter.GroupChatter.PullBurstWindow = 25
+
+#
+#   LLMChatter.GroupChatter.DeathChance
+#       Percent chance (0-100) that a bot death
+#       triggers a group reaction.
+#       Default: 40
+#
+LLMChatter.GroupChatter.DeathChance = 40
+
+#
+#   LLMChatter.GroupChatter.DeathCooldown
+#       Minimum seconds between death reactions for the
+#       same group.
+#       Default: 30
+#
+LLMChatter.GroupChatter.DeathCooldown = 30
+
+#
+#   LLMChatter.GroupChatter.CorpseRunChance
+#       Percent chance (0-100) that releasing spirit
+#       triggers a corpse run comment.
+#       Default: 80
+#
+LLMChatter.GroupChatter.CorpseRunChance = 80
+
+#
+#   LLMChatter.GroupChatter.CorpseRunCooldown
+#       Minimum seconds between corpse run comments for
+#       the same group.
+#       Default: 120
+#
+LLMChatter.GroupChatter.CorpseRunCooldown = 120
+
+#
+#   LLMChatter.GroupChatter.LootChanceGreen
+#       Percent chance (0-100) that looting a green
+#       quality item triggers a group reaction.
+#       Default: 20
+#
+LLMChatter.GroupChatter.LootChanceGreen = 15
+
+#
+#   LLMChatter.GroupChatter.LootChanceBlue
+#       Percent chance (0-100) that looting a blue
+#       quality item triggers a group reaction.
+#       Default: 60
+#
+LLMChatter.GroupChatter.LootChanceBlue = 60
+
+#
+#   LLMChatter.GroupChatter.LootChancePurple
+#       Percent chance (0-100) that looting a purple
+#       quality item triggers a group reaction.
+#       Default: 100
+#
+LLMChatter.GroupChatter.LootChancePurple = 100
+
+#
+#   LLMChatter.GroupChatter.LootChanceOrange
+#       Percent chance (0-100) that looting an orange
+#       quality item triggers a group reaction.
+#       Artifact and heirloom loot always trigger (100%).
+#       Default: 100
+#
+LLMChatter.GroupChatter.LootChanceOrange = 100
+
+#
+#   LLMChatter.GroupChatter.LootCooldown
+#       Minimum seconds between loot reactions for the
+#       same group.
+#       Default: 60
+#
+LLMChatter.GroupChatter.LootCooldown = 60
+
+#
+#   LLMChatter.GroupChatter.ResurrectChance
+#       Percent chance (0-100) that a resurrection event
+#       triggers a group reaction.
+#       Default: 100
+#
+LLMChatter.GroupChatter.ResurrectChance = 100
+
+#
+#   LLMChatter.GroupChatter.ResurrectCooldown
+#       Minimum seconds between resurrection reactions for
+#       the same group.
+#       Default: 30
+#
+LLMChatter.GroupChatter.ResurrectCooldown = 30
+
+#
+#   LLMChatter.GroupChatter.SpellCastChance
+#       Percent chance (0-100) that any spell cast
+#       triggers a group reaction.
+#       Default: 20
+#
+LLMChatter.GroupChatter.SpellCastChance = 5
+
+#
+#   LLMChatter.GroupChatter.SpellCastCooldown
+#       Minimum seconds between spell cast reactions for
+#       the same group. Prevents spam during buff/heal
+#       heavy moments.
+#       Default: 10
+#
+LLMChatter.GroupChatter.SpellCastCooldown = 10
+
+#
+#   LLMChatter.GroupChatter.StateCalloutEnable
+#       Master toggle for state-triggered callouts
+#       (low health, OOM, aggro loss).
+#       Default: 1
+#       [SERVER]
+#
+LLMChatter.GroupChatter.StateCalloutEnable = 1
+
+#
+#   LLMChatter.GroupChatter.StateCalloutChance
+#       Percentage chance (0-100) a state callout fires
+#       when a bot meets the threshold. In BGs and raids
+#       this is halved automatically.
+#       Default: 100
+#       [SERVER]
+#
+LLMChatter.GroupChatter.StateCalloutChance = 100
+
+#
+#   LLMChatter.GroupChatter.StateCalloutCooldown
+#       Seconds between state callouts per bot.
+#       In BGs and raids this is doubled automatically.
+#       Default: 60
+#       [SERVER]
+#
+LLMChatter.GroupChatter.StateCalloutCooldown = 60
+
+#
+#   LLMChatter.GroupChatter.LowHealthThreshold
+#       Health percentage at or below which a bot may
+#       call out that it is low on health.
+#       Default: 40
+#       [SERVER]
+#
+LLMChatter.GroupChatter.LowHealthThreshold = 40
+
+#
+#   LLMChatter.GroupChatter.OOMThreshold
+#       Mana percentage at or below which a mana-using
+#       bot may call out that it is out of mana.
+#       Default: 30
+#       [SERVER]
+#
+LLMChatter.GroupChatter.OOMThreshold = 20
+
+#
+#   LLMChatter.GroupChatter.EmoteReactDelay
+#       Seconds before emote reactions are picked up
+#       by Python. Lower = faster bot response to
+#       player emotes.
+#       Default: 2
+#       [SERVER]
+#
+LLMChatter.GroupChatter.EmoteReactDelay = 2
+
+#
+#   LLMChatter.GroupChatter.NearbyObjectEnable
+#       Enable ambient comments about nearby objects/creatures
+#       Default: 1
+#
+LLMChatter.GroupChatter.NearbyObjectEnable = 1
+
+#
+#   LLMChatter.GroupChatter.NearbyObjectChance
+#       Percent chance (0-100) that a nearby point of interest
+#       (moonwell, forge, rare creature, quest giver, etc.)
+#       triggers a comment. Scanned periodically per group.
+#       Default: 15
+#
+LLMChatter.GroupChatter.NearbyObjectChance = 8
+
+#
+#   LLMChatter.GroupChatter.NearbyObjectCheckInterval
+#       How often (in seconds) the system scans for
+#       nearby points of interest per group.
+#       Default: 45
+#
+LLMChatter.GroupChatter.NearbyObjectCheckInterval = 30
+
+#
+#   LLMChatter.GroupChatter.NearbyObjectCooldown
+#       Minimum seconds between nearby object comments
+#       for the same group. Prevents spam even if scans
+#       keep finding interesting objects.
+#       Default: 180
+#
+LLMChatter.GroupChatter.NearbyObjectCooldown = 180
+
+#
+#   LLMChatter.NearbyObject.ConversationChance
+#       Chance (0-100) that a nearby object reaction
+#       becomes a multi-bot conversation instead of a
+#       single statement.
+#       Default: 40
+#       [BRIDGE]
+#
+LLMChatter.NearbyObject.ConversationChance = 40
+
+#
+#   LLMChatter.GroupChatter.ZoneTransitionChance
+#       Percent chance (0-100) that a zone or subzone
+#       transition triggers a party chat reaction.
+#       Fires when the player crosses any zone or area
+#       boundary (e.g. Darnassus → Teldrassil, or
+#       Shadowglen → Aldrassil).
+#       Default: 30
+#
+LLMChatter.GroupChatter.ZoneTransitionChance = 20
+
+#
+#   LLMChatter.GroupChatter.ZoneTransitionCooldown
+#       Minimum seconds between zone transition
+#       reactions for the same group.
+#       Default: 120
+#
+LLMChatter.GroupChatter.ZoneTransitionCooldown = 120
+
+#
+#   LLMChatter.GroupChatter.DungeonEntryChance
+#       Percent chance (0-100) that entering a dungeon
+#       instance triggers a party chat reaction.
+#       Default: 100
+#
+LLMChatter.GroupChatter.DungeonEntryChance = 100
+
+#
+#   LLMChatter.GroupChatter.DungeonEntryCooldown
+#       Minimum seconds between dungeon entry reactions
+#       for the same group.
+#       Default: 300
+#
+LLMChatter.GroupChatter.DungeonEntryCooldown = 300
+
+#
+#   LLMChatter.GroupChatter.WipeChance
+#       Percent chance (0-100) that a full-party wipe
+#       triggers a reaction.
+#       Default: 100
+#
+LLMChatter.GroupChatter.WipeChance = 100
+
+#
+#   LLMChatter.GroupChatter.WipeCooldown
+#       Minimum seconds between wipe reactions for the
+#       same group.
+#       Default: 120
+#
+LLMChatter.GroupChatter.WipeCooldown = 120
+
+#
+#   LLMChatter.GroupChatter.PvP.Enable [SERVER]
+#       Enable group reactions to open-world fights against the
+#       opposing faction: engaging an enemy, defeating one, being
+#       killed by one, offensive spells, and low health or mana
+#       during the fight. Enemies may be real players or
+#       playerbots; prompts treat both as characters of the
+#       opposing faction. Battlegrounds and arenas are not affected.
+#       Stealthed or unseen enemies are never named.
+#       When 0, reactions during PvP fights are silent; they do not
+#       fall back to creature-style reactions.
+#       Default: 1
+#
+LLMChatter.GroupChatter.PvP.Enable = 1
+
+#
+#   LLMChatter.GroupChatter.PvP.CombatChance [SERVER]
+#       Percent chance (0-100) that engaging an opposing-faction
+#       enemy triggers a battle cry.
+#       Default: 60
+#
+LLMChatter.GroupChatter.PvP.CombatChance = 30
+
+#
+#   LLMChatter.GroupChatter.PvP.KillChance [SERVER]
+#       Percent chance (0-100) that defeating an opposing-faction
+#       enemy triggers a reaction.
+#       Default: 80
+#
+LLMChatter.GroupChatter.PvP.KillChance = 50
+
+#
+#   LLMChatter.GroupChatter.PvP.DeathChance [SERVER]
+#       Percent chance (0-100) that a group member killed by an
+#       opposing-faction enemy triggers a reaction. Shares the
+#       DeathCooldown with creature deaths; full wipes use
+#       WipeChance and WipeCooldown.
+#       Default: 60
+#
+LLMChatter.GroupChatter.PvP.DeathChance = 40
+
+#
+#   LLMChatter.GroupChatter.PvP.Cooldown [SERVER]
+#       Minimum seconds between PvP reactions of the same kind
+#       (engage, kill, death) for the same group.
+#       Default: 30
+#
+LLMChatter.GroupChatter.PvP.Cooldown = 30
+
+#
+#   LLMChatter.GroupChatter.PvP.EnemyCooldown [SERVER]
+#       Minimum seconds between PvP reactions of the same kind
+#       about the same enemy for the same group. Keeps repeated
+#       ganks and corpse camping from flooding chat.
+#       Default: 120
+#
+LLMChatter.GroupChatter.PvP.EnemyCooldown = 120
+
+#
+#   LLMChatter.GroupChatter.PvP.TargetSwitchCallout [SERVER]
+#       Players have no threat table, so the tank aggro-loss
+#       callout becomes an "enemy switched targets" callout in
+#       PvP. Set to 0 to suppress it during PvP fights.
+#       Default: 1
+#
+LLMChatter.GroupChatter.PvP.TargetSwitchCallout = 1
+
+#
+#   LLMChatter.GroupChatter.Duel.Enable [SERVER]
+#       Enable group reactions to duels involving a member of a
+#       group with a real player and bots. Bot duellists and group
+#       bots watching the duel can react.
+#       Default: 1
+#
+LLMChatter.GroupChatter.Duel.Enable = 1
+
+#
+#   LLMChatter.GroupChatter.Duel.StartChance [SERVER]
+#       Percent chance (0-100) of a reaction when a duel starts.
+#       Default: 60
+#
+LLMChatter.GroupChatter.Duel.StartChance = 30
+
+#
+#   LLMChatter.GroupChatter.Duel.EndChance [SERVER]
+#       Percent chance (0-100) of a reaction when a duel ends.
+#       Default: 100
+#
+LLMChatter.GroupChatter.Duel.EndChance = 60
+
+#
+#   LLMChatter.GroupChatter.Duel.Cooldown [SERVER]
+#       Minimum seconds between duel start reactions, and between
+#       duel end reactions, for the same group.
+#       Default: 60
+#
+LLMChatter.GroupChatter.Duel.Cooldown = 60
+
+#
+#   LLMChatter.GroupChatter.BotQuestionEnable
+#       Enable bot-initiated questions to player.
+#       Default: 1
+#
+LLMChatter.GroupChatter.BotQuestionEnable = 1
+
+#
+#   LLMChatter.GroupChatter.BotQuestionChance
+#       Chance (0-100) per check that a bot spontaneously
+#       asks the player a contextual question during downtime.
+#       Checked every ~30 seconds. Has a 10-minute per-group
+#       cooldown to prevent question fatigue.
+#       Default: 1
+#
+LLMChatter.GroupChatter.BotQuestionChance = 3
+
+#
+#   LLMChatter.GroupChatter.BotQuestionCheckInterval
+#       How often (in seconds) the bridge checks for
+#       bot-initiated player questions.
+#       Default: 30
+#       [BRIDGE]
+#
+LLMChatter.GroupChatter.BotQuestionCheckInterval = 30
+
+#
+#   LLMChatter.GroupChatter.QuestAcceptChance
+#       Percent chance (0-100) that accepting a quest
+#       triggers a group reaction.
+#       Default: 70
+#
+LLMChatter.GroupChatter.QuestAcceptChance = 25
+
+#
+#   LLMChatter.GroupChatter.QuestAcceptCooldown
+#       Minimum seconds between quest accept reactions
+#       for the same group.
+#       Default: 30
+#
+LLMChatter.GroupChatter.QuestAcceptCooldown = 30
+
+#
+#   LLMChatter.GroupChatter.QuestAcceptDebounceSec
+#       Seconds to batch near-simultaneous quest accepts
+#       before emitting a chatter event.
+#       Default: 5
+#
+LLMChatter.GroupChatter.QuestAcceptDebounceSec = 5
+
+#
+#   LLMChatter.GroupChatter.QuestObjectiveChance
+#       Percent chance (0-100) that completing quest
+#       objectives triggers a group reaction.
+#       Default: 70
+#
+LLMChatter.GroupChatter.QuestObjectiveChance = 20
+
+#
+#   LLMChatter.GroupChatter.QuestObjectiveCooldown
+#       Minimum seconds between quest objective reactions
+#       for the same group.
+#       Default: 30
+#
+LLMChatter.GroupChatter.QuestObjectiveCooldown = 30
+
+#
+#   LLMChatter.GroupChatter.QuestObjSuppressWindow
+#       Seconds after quest accept during which an
+#       objectives-complete event is suppressed.
+#       Prevents instant-complete reactions for
+#       breadcrumb/delivery quests where objectives
+#       fire immediately after accept.
+#       Set to 0 to disable suppression.
+#       Default: 10
+#
+LLMChatter.GroupChatter.QuestObjSuppressWindow = 10
+
+#
+#   LLMChatter.GroupChatter.QuestCompleteChance
+#       Percent chance (0-100) that turning in a quest
+#       triggers a group reaction.
+#       Default: 70
+#
+LLMChatter.GroupChatter.QuestCompleteChance = 40
+
+#
+#   LLMChatter.GroupChatter.QuestConversationChance
+#       Chance (0-100) that a quest event triggers a multi-bot
+#       conversation instead of a single-statement reaction.
+#       Default: 30
+#
+LLMChatter.GroupChatter.QuestConversationChance = 30
+
+#
+#   LLMChatter.GroupChatter.PlayerMsgConversationChance
+#       Percent chance (0-100) that a player message triggers
+#       a multi-bot conversation instead of a single response.
+#       Default: 30
+#
+LLMChatter.GroupChatter.PlayerMsgConversationChance = 30
+
+#
+#   LLMChatter.GroupChatter.PlayerMsgSecondBotChance
+#       Percent chance (0-100) that a second bot chimes in
+#       after a single-bot response to a player message.
+#       Default: 25
+#
+LLMChatter.GroupChatter.PlayerMsgSecondBotChance = 25
+
+#
+#   LLMChatter.GroupChatter.PlayerMsgCooldown
+#       Minimum seconds between group reactions to player
+#       chat messages.
+#       Default: 0
+#
+LLMChatter.GroupChatter.PlayerMsgCooldown = 0
+
+#
+#   LLMChatter.GroupChatter.GeneralRelayEnable
+#       Enables party-chat reactions to bot-authored General
+#       channel messages in the same zone.
+#       Default: 1
+#       [BRIDGE]
+#
+LLMChatter.GroupChatter.GeneralRelayEnable = 1
+
+#
+#   LLMChatter.GroupChatter.GeneralRelayChance
+#       Percent chance (0-100) that a bot-authored General
+#       channel message triggers one grouped party reaction.
+#       Default: 15
+#       [BRIDGE]
+#
+LLMChatter.GroupChatter.GeneralRelayChance = 10
+
+#
+#   LLMChatter.GroupChatter.GeneralRelayConversationChance
+#       After GeneralRelayChance succeeds, percent chance
+#       (0-100) that 2-3 grouped bots have a short party
+#       conversation instead of one bot making a statement.
+#       Requires at least 2 eligible responder bots.
+#       Default: 75
+#       [BRIDGE]
+#
+LLMChatter.GroupChatter.GeneralRelayConversationChance = 50
+
+#
+#   LLMChatter.GroupChatter.GeneralRelayCooldown
+#       Minimum seconds between General-to-party relay
+#       reactions per group.
+#       Default: 120
+#       [BRIDGE]
+#
+LLMChatter.GroupChatter.GeneralRelayCooldown = 120
+
+#
+#   LLMChatter.GroupChatter.GeneralRelayMinLagSeconds
+#       Minimum seconds after the General line is scheduled
+#       to appear before the first party reaction appears.
+#       Default: 3
+#       [BRIDGE]
+#
+LLMChatter.GroupChatter.GeneralRelayMinLagSeconds = 3
+
+#
+#   LLMChatter.GroupChatter.GeneralRelayMaxLagSeconds
+#       Maximum seconds after the General line is scheduled
+#       to appear before the first party reaction appears.
+#       Default: 6
+#       [BRIDGE]
+#
+LLMChatter.GroupChatter.GeneralRelayMaxLagSeconds = 6
+
+#
+#   LLMChatter.GroupChatter.GeneralRelayMaxGroups
+#       Maximum active groups that can receive a party relay
+#       for one General channel line.
+#       Default: 1
+#       [BRIDGE]
+#
+LLMChatter.GroupChatter.GeneralRelayMaxGroups = 1
+
+###############################################################################
+# GENERAL CHANNEL TUNING [BOTH]
+###############################################################################
+
+#
+#   LLMChatter.GeneralChat.ReactionChance
+#       Chance (0-100) that a bot reacts when a player types
+#       a non-question message in General chat. Questions
+#       (ending with ?) use QuestionChance instead.
+#       Default: 100
+#
+LLMChatter.GeneralChat.ReactionChance = 100
+
+#
+#   LLMChatter.GeneralChat.QuestionChance
+#       Chance (0-100) that a bot reacts when a player's
+#       General chat message ends with "?". Messages without
+#       "?" use ReactionChance instead. This simple detection
+#       gives direct questions a higher response rate, but
+#       statements and remarks also trigger at ReactionChance.
+#       Default: 100
+#
+LLMChatter.GeneralChat.QuestionChance = 100
+
+#
+#   LLMChatter.GeneralChat.Cooldown
+#       Per-zone, per-faction cooldown (seconds) between bot reactions
+#       to player messages in General chat. Set to 0 to disable.
+#       Default: 3
+#
+LLMChatter.GeneralChat.Cooldown = 3
+
+#
+#   LLMChatter.GeneralChat.ReactDelay
+#       Seconds before General chat reactions are
+#       picked up by Python after being queued by C++.
+#       Default: 5
+#       [SERVER]
+#
+LLMChatter.GeneralChat.ReactDelay = 5
+
+#
+#   LLMChatter.GeneralChat.MinZoneGap
+#       Minimum seconds between ambient General channel
+#       messages in the same zone. Prevents flurries of
+#       messages appearing in quick succession after a
+#       lucky RNG streak. Automated ambient and world-
+#       event conversations reserve their full delivery
+#       window, so another sequence waits until this gap
+#       has elapsed after the final scheduled line.
+#       Default: 15
+#       [BRIDGE]
+#
+LLMChatter.GeneralChat.MinZoneGap = 15
+
+#
+#   LLMChatter.GeneralChat.ConversationChance
+#       Player reaction conversations — chance (0-100)
+#       that when a player speaks in General channel,
+#       a second bot joins the conversation. Requires
+#       2+ bots in the zone. Separate from
+#       LLMChatter.ConversationChance which controls
+#       ambient (unprompted) conversation frequency.
+#       Default: 30
+#       [BRIDGE]
+#
+LLMChatter.GeneralChat.ConversationChance = 30
+
+#
+#   LLMChatter.GeneralChat.ExtendedConversationChance
+#       Chance (0-100) that after a 2-bot player
+#       reaction conversation, the exchange continues
+#       with additional back-and-forth messages.
+#       Uses diminishing continuation chances per
+#       extra message (70%, 50%, 30%).
+#       Default: 40
+#       [BRIDGE]
+#
+LLMChatter.GeneralChat.ExtendedConversationChance = 40
+
+#
+#   LLMChatter.GeneralChat.ExtendedMaxMessages
+#       Maximum total bot messages in a player
+#       reaction conversation (including the initial
+#       2-bot exchange). Minimum: 3, Maximum: 8.
+#       Lower values reduce worker thread blocking.
+#       Default: 3
+#       [BRIDGE]
+#
+LLMChatter.GeneralChat.ExtendedMaxMessages = 3
+
+#
+#   LLMChatter.GeneralChat.PlayerReplyLengthWeights [BRIDGE]
+#       Relative weights for short, medium and developed player replies.
+#       Three nonnegative integers with a positive total. Invalid values use
+#       the default. Followups avoid the previous band if another is enabled.
+#       Both normal and roleplay modes use this policy. Brief casual replies
+#       keep PlayerChat.BriefCasualLengthWeights instead.
+#       Requires bridge restart to take effect.
+#       Default: 35,45,20
+#
+LLMChatter.GeneralChat.PlayerReplyLengthWeights = 35,45,20
+
+#
+#   LLMChatter.GeneralChat.PlayerReplyLengthMaxima [BRIDGE]
+#       Approximate short, medium and developed character ceilings.
+#       Three strictly increasing integers in 1-255. Invalid values use the
+#       default. Targets guide wording; never pad a reply to reach a minimum.
+#       Player conversational scale takes priority. Delivery caps at 255.
+#       Does not change Party, Guild or autonomous General length policies.
+#       Requires bridge restart to take effect.
+#       Default: 75,150,240
+#
+LLMChatter.GeneralChat.PlayerReplyLengthMaxima = 75,150,240
+
+###############################################################################
+# RAID CHATTER TUNING [SERVER]
+###############################################################################
+
+#
+#   LLMChatter.RaidChatter.BossPullChance
+#       Percent chance (0-100) that a raid boss pull
+#       triggers chatter.
+#       Default: 80
+#
+LLMChatter.RaidChatter.BossPullChance = 80
+
+#
+#   LLMChatter.RaidChatter.BossKillChance
+#       Percent chance (0-100) that a raid boss kill
+#       triggers chatter.
+#       Default: 100
+#
+LLMChatter.RaidChatter.BossKillChance = 100
+
+#
+#   LLMChatter.RaidChatter.BossWipeChance
+#       Percent chance (0-100) that a raid boss wipe
+#       triggers chatter.
+#       Default: 100
+#
+LLMChatter.RaidChatter.BossWipeChance = 100
+
+#
+#   LLMChatter.RaidChatter.MoraleEnable
+#       Enable idle morale chatter in raid instances.
+#       Bots may comment on the atmosphere between bosses.
+#       Default: 1
+#
+LLMChatter.RaidChatter.MoraleEnable = 1
+
+#
+#   LLMChatter.RaidChatter.MoraleChance
+#       Percent chance (0-100) per check that between-pull
+#       morale chatter fires in a raid instance. Checked
+#       each poll cycle after the cooldown expires.
+#       Default: 30
+#
+LLMChatter.RaidChatter.MoraleChance = 30
+
+#
+#   LLMChatter.RaidChatter.MoraleCooldown
+#       Minimum seconds between raid morale chatter triggers
+#       for the same raid instance.
+#       Default: 120
+#
+LLMChatter.RaidChatter.MoraleCooldown = 60
+
+#
+###############################################################################
+# GUILD CHATTER TUNING [SERVER] - read by the worldserver module; these keys take
+# effect immediately for pending rows via `.reload config`.
+###############################################################################
+#
+#   LLMChatter.GuildChatter.Enable
+#       Ambient guild-channel chatter. When enabled,
+#       online bot guild members occasionally post a
+#       short in-character line to guild chat. Enabled by
+#       default so guilds feel active immediately.
+#       Default: 1
+#
+LLMChatter.GuildChatter.Enable = 1
+
+#
+#   LLMChatter.GuildChatter.Chance
+#       Percent chance (1-100) that an eligible guild
+#       produces a statement or conversation on each check.
+#       Default: 15
+#
+LLMChatter.GuildChatter.Chance = 8
+
+#
+#   LLMChatter.GuildChatter.Cooldown
+#       Minimum seconds between Guild chatter events for
+#       the same guild.
+#       Default: 300
+#
+LLMChatter.GuildChatter.Cooldown = 180
+
+#
+#   LLMChatter.GuildChatter.ScanInterval
+#       Seconds between world scans for eligible
+#       guilds. Kept separate from Cooldown so
+#       player-gating does not cause long silent
+#       windows: scanning is cheap, the per-guild
+#       Cooldown still limits actual lines.
+#       Default: 30
+#
+LLMChatter.GuildChatter.ScanInterval = 30
+
+#
+#   LLMChatter.GuildChatter.ConversationChance
+#       Percent chance (0-100) that an eligible Guild
+#       trigger becomes a two- or three-speaker
+#       conversation instead of one statement.
+#       Requires at least two eligible guild bots.
+#       Default: 50
+#
+LLMChatter.GuildChatter.ConversationChance = 35
+
+#
+#   LLMChatter.GuildChatter.MaxParticipants
+#       Maximum Guild conversation speakers. Supported
+#       range is 2-3; values outside it are clamped.
+#       Default: 3
+#
+LLMChatter.GuildChatter.MaxParticipants = 3
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.Enable
+#       When enabled, a real player's Guild message
+#       always queues at least one eligible bot reply.
+#       Response shape remains probabilistic.
+#       Default: 1
+#
+LLMChatter.GuildChatter.PlayerReplies.Enable = 1
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.DebounceSeconds
+#       Short collection window for rapid consecutive
+#       player messages. New turns supersede undelivered
+#       continuation lines from the previous turn.
+#       Default: 2
+#
+LLMChatter.GuildChatter.PlayerReplies.DebounceSeconds = 2
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.IdleSuppressionSeconds
+#       Prevent ambient Guild chatter from interrupting a
+#       recent player-driven exchange.
+#       Default: 90
+#
+LLMChatter.GuildChatter.PlayerReplies.IdleSuppressionSeconds = 90
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.MaxCandidates
+#       Maximum live Guild bots passed to the bridge for
+#       addressed-bot and responder selection.
+#       Default: 12
+#
+LLMChatter.GuildChatter.PlayerReplies.MaxCandidates = 12
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.Enable
+#       Greet a real guild member after a full character
+#       login. The greeting is cancelled if the player
+#       speaks first, logs out, or changes Guild.
+#       Default: 1
+#
+LLMChatter.GuildChatter.LoginGreeting.Enable = 1
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.Chance
+#       Chance (0-100) to schedule a greeting attempt.
+#       At least one eligible bot is selected on success.
+#       Default: 100
+#
+LLMChatter.GuildChatter.LoginGreeting.Chance = 100
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.QuickChance
+#   LLMChatter.GuildChatter.LoginGreeting.BusyChance
+#       Weighted initial delay bands. Quick uses 2-5
+#       seconds; Busy uses 25-45 seconds; the remainder
+#       uses the ordinary 8-20 second band. If the sum
+#       exceeds 100, BusyChance is clamped.
+#       Defaults: Quick = 20, Busy = 25
+#
+LLMChatter.GuildChatter.LoginGreeting.QuickChance = 20
+LLMChatter.GuildChatter.LoginGreeting.BusyChance = 25
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.RetryInterval
+#   LLMChatter.GuildChatter.LoginGreeting.ReadinessTimeout
+#       Retry interval and total bounded wait when Guild
+#       bots are still loading. Values are seconds;
+#       ReadinessTimeout is clamped to at least 45.
+#       Defaults: RetryInterval = 5, ReadinessTimeout = 90
+#
+LLMChatter.GuildChatter.LoginGreeting.RetryInterval = 5
+LLMChatter.GuildChatter.LoginGreeting.ReadinessTimeout = 90
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.MaxCandidates
+#       Maximum live Guild bots passed to the bridge for
+#       greeting responder selection.
+#       Default: 12
+#
+LLMChatter.GuildChatter.LoginGreeting.MaxCandidates = 12
+
+#
+###############################################################################
+# GUILD CHATTER PROMPT TUNING [BRIDGE] - read by the Python chatter bridge, NOT the
+# worldserver. `.reload config` does NOT affect this key; restart the
+# ac-llm-chatter-bridge container to apply changes.
+###############################################################################
+#
+#   LLMChatter.GuildChatter.MaxTokens
+#       Base output token budget per Guild generation.
+#       Conversations scale this by participant count,
+#       capped at 1000 tokens. Reasoning
+#       models spend part of this budget thinking before
+#       emitting text, so raise it (e.g. 2000-3000) if
+#       you use one and see empty replies.
+#       Default: 200
+#
+LLMChatter.GuildChatter.MaxTokens = 200
+
+#
+#   LLMChatter.GuildChatter.MaxConversationLines
+#       Maximum lines in a Guild conversation. The
+#       minimum is the participant count so every
+#       selected speaker can contribute at least once.
+#       Default: 4
+#
+LLMChatter.GuildChatter.MaxConversationLines = 4
+
+#
+#   LLMChatter.GuildChatter.HistoryContextChance
+#       Chance (0-100) that an autonomous Guild statement
+#       or conversation receives recent visible Guild
+#       history as optional continuity context. One roll
+#       applies to the whole event, including repair and
+#       statement fallback.
+#       Default: 35
+#
+LLMChatter.GuildChatter.HistoryContextChance = 35
+
+#
+#   LLMChatter.GuildChatter.HistoryContextMessages
+#       Maximum recent visible Guild lines included after
+#       a successful HistoryContextChance roll. The topic
+#       remains the creative direction; history is ignored
+#       when it does not connect naturally.
+#       Default: 15
+#
+LLMChatter.GuildChatter.HistoryContextMessages = 15
+
+#
+#   LLMChatter.GuildChatter.ParticipantReferenceChance
+#       Independent percent chance (0-100) for each
+#       non-opening Guild conversation line to naturally
+#       name one or more earlier speakers. Zero, one, or
+#       several reference lines may occur.
+#       Default: 25
+#
+LLMChatter.GuildChatter.ParticipantReferenceChance = 25
+
+#
+#   LLMChatter.GuildChatter.MultiReferenceChance
+#       Conditional percent chance (0-100) that a selected
+#       reference line names two earlier speakers when at
+#       least two valid speakers are available.
+#       Default: 15
+#
+LLMChatter.GuildChatter.MultiReferenceChance = 15
+
+#
+#   LLMChatter.GuildChatter.MaxReferenceLines
+#       Maximum number of RNG-selected reference lines in
+#       one Guild conversation. Spontaneous model-written
+#       references are not removed.
+#       Default: 2
+#
+LLMChatter.GuildChatter.MaxReferenceLines = 2
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.MultiReplyChance
+#       Chance (0-100) that two to four Guild bots greet
+#       the player instead of a single greeting. With four eligible
+#       bots and MaxResponders = 4, 75 gives each count equal odds.
+#       Default: 75
+#
+LLMChatter.GuildChatter.LoginGreeting.MultiReplyChance = 75
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.MaxResponders
+#       Maximum greeting bots. Supported range is 1-4.
+#       Default: 4
+#
+LLMChatter.GuildChatter.LoginGreeting.MaxResponders = 4
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.PlayerNameChance
+#       Chance (0-100) that the primary greeter naturally
+#       addresses the player by name.
+#       Default: 60
+#
+LLMChatter.GuildChatter.LoginGreeting.PlayerNameChance = 60
+
+#
+#   LLMChatter.GuildChatter.LoginGreeting.MaxCharacters
+#       Hard character cap for each short greeting.
+#       Supported range is 40-150.
+#       Default: 100
+#
+LLMChatter.GuildChatter.LoginGreeting.MaxCharacters = 100
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.MultiReplyChance
+#       Chance (0-100) that two or three bots give
+#       independent reactions to the player after the
+#       conversation roll fails.
+#       Default: 15
+#
+LLMChatter.GuildChatter.PlayerReplies.MultiReplyChance = 15
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.MultiAddressedBonus
+#       Additional multi-reply chance (0-100) when the
+#       player clearly addresses several guildmates. This
+#       is a boost, not a guarantee, so one reply remains
+#       the most common outcome.
+#       Default: 15
+#
+LLMChatter.GuildChatter.PlayerReplies.MultiAddressedBonus = 15
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.ConversationChance
+#       Chance (0-100) that the player's message starts a
+#       genuine multi-bot conversation. This is evaluated
+#       before MultiReplyChance.
+#       Default: 20
+#
+LLMChatter.GuildChatter.PlayerReplies.ConversationChance = 20
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.MaxResponders
+#       Maximum responding bots for player-driven Guild
+#       exchanges. Supported range is 1-3.
+#       Default: 3
+#
+LLMChatter.GuildChatter.PlayerReplies.MaxResponders = 3
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.PlayerNameChance
+#       Chance (0-100) that the primary reply naturally
+#       addresses the player by name.
+#       Default: 35
+#
+LLMChatter.GuildChatter.PlayerReplies.PlayerNameChance = 35
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.CallbackChance
+#       Chance (0-100) to make a subtle, relevant callback
+#       to an earlier interaction from this login session.
+#       Default: 25
+#
+LLMChatter.GuildChatter.PlayerReplies.CallbackChance = 25
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.FollowupQuestionChance
+#       Chance (0-100) that one responder asks a natural
+#       follow-up question when the context supports it.
+#       Default: 20
+#
+LLMChatter.GuildChatter.PlayerReplies.FollowupQuestionChance = 20
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.RecentSpeakerPenalty
+#       Percent weight reduction for bots that spoke
+#       recently. Addressed bots bypass this soft penalty.
+#       Default: 60
+#
+LLMChatter.GuildChatter.PlayerReplies.RecentSpeakerPenalty = 60
+
+#
+#   LLMChatter.GuildChatter.PlayerReplies.FirstDelayMin
+#   LLMChatter.GuildChatter.PlayerReplies.FirstDelayMax
+#       Additional bridge-side delay range before the first
+#       reply. Later lines use the full shared reading,
+#       typing, and distraction pacing.
+#       Defaults: 8 / 20
+#
+LLMChatter.GuildChatter.PlayerReplies.FirstDelayMin = 8
+LLMChatter.GuildChatter.PlayerReplies.FirstDelayMax = 20
+
+#
+#   LLMChatter.GuildChatter.SessionMemory.Enable
+#       Keep a per-player Guild interaction memory for the
+#       current login session. Login and logout clear it.
+#       Default: 1
+#
+LLMChatter.GuildChatter.SessionMemory.Enable = 1
+
+#
+#   LLMChatter.GuildChatter.SessionMemory.SummaryThresholdChars
+#       Summarize older unsummarized interaction lines when
+#       their combined size reaches this threshold.
+#       Default: 3500
+#
+LLMChatter.GuildChatter.SessionMemory.SummaryThresholdChars = 3500
+
+#
+#   LLMChatter.GuildChatter.SessionMemory.SummaryMaxInputChars
+#       Maximum older-transcript characters sent in one
+#       compaction call. Protects smaller local contexts
+#       after repeated summary failures.
+#       Default: 8000
+#
+LLMChatter.GuildChatter.SessionMemory.SummaryMaxInputChars = 8000
+
+#
+#   LLMChatter.GuildChatter.SessionMemory.KeepRecentMessages
+#       Latest visible Guild lines retained verbatim in
+#       player-reply prompts: player messages,
+#       player-driven replies, ambient statements, and
+#       ambient conversations. Autonomous Guild chatter
+#       has a separate probabilistic raw-history setting.
+#       Default: 15
+#
+LLMChatter.GuildChatter.SessionMemory.KeepRecentMessages = 15
+
+#
+#   LLMChatter.GuildChatter.SessionMemory.SummaryMaxTokens
+#       Output budget for the provider-neutral summary call.
+#       The configured chatter provider and model are reused.
+#       Default: 300
+#
+LLMChatter.GuildChatter.SessionMemory.SummaryMaxTokens = 300
+
+#
+#   LLMChatter.GuildChatter.SessionMemory.SummaryMaxChars
+#       Maximum stored rolling-summary length.
+#       Default: 1200
+#
+LLMChatter.GuildChatter.SessionMemory.SummaryMaxChars = 1200
+
+#
+#   LLMChatter.GuildChatter.ZoneNameChance
+#       Percent chance (0-100) that a Guild event may name
+#       the primary speaker's current zone. Guild chat reaches
+#       guildmates scattered across other zones, so a bot
+#       saying "this swamp" is meaningless to them. The model
+#       cannot be trusted to self-pace this, so the decision
+#       is made once per event: on a hit the prompt
+#       asks the bot to work the zone name in; on a miss the
+#       prompt forbids referencing the location at all.
+#       Set 0 to never name, 100 to always name.
+#       Default: 20
+#
+LLMChatter.GuildChatter.ZoneNameChance = 20
+
+#
+#   LLMChatter.RaidChatter.BattleCryChance
+#       Percent chance (0-100) that a raid-wide battle cry
+#       fires when engaging a boss or elite in a raid instance.
+#       A different bot from the party reactor shouts in raid chat.
+#       No cooldown — pure RNG gating.
+#       Default: 70
+#
+LLMChatter.RaidChatter.BattleCryChance = 70
+
+#
+#   LLMChatter.RaidChatter.IdleChance
+#       Percent chance (0-100) for idle chatter per tick
+#       when inside a raid instance. Overrides the normal
+#       GroupChatter.IdleChance for raids.
+#       Default: 30
+#
+LLMChatter.RaidChatter.IdleChance = 15
+
+#
+#   LLMChatter.RaidChatter.IdleCooldown
+#       Minimum seconds between idle chatter messages
+#       when inside a raid instance. Overrides the normal
+#       GroupChatter.IdleCooldown for raids.
+#       Default: 20
+#
+LLMChatter.RaidChatter.IdleCooldown = 60
+
+###############################################################################
+# PROMPT / OUTPUT TUNING [BRIDGE]
+###############################################################################
+
+#
+#   LLMChatter.ActionChance
+#       Chance (0-100) that a response includes a narrator action
+#       displayed as *action* before the spoken text.
+#       Only applies in roleplay mode.
+#       Default: 20
+#
+LLMChatter.ActionChance = 15
+
+#
+#   LLMChatter.ActionAsEmote.Enable
+#       Deliver the action as a separate text emote sent just
+#       before the spoken line, so it reads as a real emote in the
+#       chat log ("Miranda looks out the window") rather than
+#       *asterisks* glued to the speech.
+#       Set to 0 to restore the old inline "*action* text" form.
+#       Note that /e is proximity based: on party, raid, guild and
+#       General messages the emote is only seen by players standing
+#       near the bot, while the spoken line still reaches the whole
+#       channel.
+#       Default: 1
+#
+LLMChatter.ActionAsEmote.Enable = 1
+
+#
+#   LLMChatter.EmoteChance
+#       Chance (0-100) that the emote list is included in
+#       prompts. When skipped, the model returns null for
+#       the emote field, saving ~500 tokens per call.
+#       Lower values improve speed on smaller models.
+#       Default: 30
+#
+LLMChatter.EmoteChance = 30
+
+#
+#   LLMChatter.RaceLoreChance
+#       Percent chance (0-100) that race-specific lore flavor
+#       is injected into chatter prompts (roleplay mode only).
+#       Default: 15
+#
+LLMChatter.RaceLoreChance = 20
+
+#
+#   LLMChatter.ConversationPacing
+#       Multiplier for delay between messages in
+#       multi-message conversations (ambient and group).
+#       Applied to the computed delay before min/max clamp.
+#       0.5 = snappy back-and-forth (half delay)
+#       1.0 = default pacing
+#       2.0 = leisurely RP pace (double delay)
+#       Default: 1.0
+#
+LLMChatter.ConversationPacing = 1.0
+
+###############################################################################
+# SAFETY / PERFORMANCE [BOTH]
+#
+#   Controls that affect API spend, throughput, and server resources.
+#
+###############################################################################
+
+#
+#   LLMChatter.MaxTokens
+#       Maximum tokens in the LLM response
+#       Format: a positive whole token count with no commas or suffix.
+#       Default: 350
+#
+LLMChatter.MaxTokens = 350
+
+#
+#   LLMChatter.ConversationMaxTokens
+#       Maximum tokens for conversation responses (2-4 messages)
+#       Format: a positive whole token count with no commas or suffix.
+#       Recommended: 700-800 to avoid JSON truncation
+#       Default: 700
+#
+LLMChatter.ConversationMaxTokens = 700
+
+#
+#   LLMChatter.Temperature
+#       LLM temperature (0.0 = focused, 1.0 = creative)
+#       Format: a decimal from 0.0 through 1.0, for example 0.8.
+#       Automatically omitted for models that do not support custom values.
+#       Default: 0.8
+#
+LLMChatter.Temperature = 0.8
+
+#
+#   LLMChatter.MaxMessageLength
+#       Maximum character length for chat messages.
+#       Messages longer than this are truncated.
+#       Default: 250
+#
+LLMChatter.MaxMessageLength = 250
+
+#
+#   LLMChatter.MaxPendingRequests
+#       Maximum pending General chatter requests in the queue.
+#       When this limit is reached, the server stops creating
+#       new ambient chatter until the bridge catches up.
+#       Prevents queue buildup if the bridge or LLM is slow.
+#       Default: 5
+#
+LLMChatter.MaxPendingRequests = 5
+
+#
+#   LLMChatter.MaxBotsPerZone
+#       Maximum bots collected per zone for ambient chatter selection
+#       Default: 8
+#
+LLMChatter.MaxBotsPerZone = 8
+
+#
+#   LLMChatter.Bridge.PollIntervalSeconds
+#       How often the Python bridge checks for new requests
+#       Default: 3
+#
+LLMChatter.Bridge.PollIntervalSeconds = 1
+
+#
+#   LLMChatter.GroupChatter.ReactDelay.Join
+#       Seconds C++ waits before the bot join event becomes
+#       eligible for Python processing. Shorter = faster
+#       greetings. A small value (1s) keeps a natural pause.
+#       Default: 1
+#
+LLMChatter.GroupChatter.ReactDelay.Join = 1
+
+#
+#   LLMChatter.Bridge.MaxConcurrent
+#       Maximum events processed in parallel. Higher = faster
+#       throughput but more simultaneous API calls.
+#       Default: 3
+#
+LLMChatter.Bridge.MaxConcurrent = 5
+
+#
+#   LLMChatter.Bridge.InterSystemStaggerMin
+#   LLMChatter.Bridge.InterSystemStaggerMax
+#       Random delay range (seconds) added when two
+#       different systems (General ambient + group idle)
+#       submit LLM calls in the same poll cycle, to
+#       prevent messages arriving simultaneously in game.
+#       Default: Min = 3, Max = 6
+#
+LLMChatter.Bridge.InterSystemStaggerMin = 3
+LLMChatter.Bridge.InterSystemStaggerMax = 6
+
+#
+#   LLMChatter.MessageDelayMin
+#       Minimum delay (milliseconds) before a bot sends a
+#       message. Simulates "reading + typing" time. Applies
+#       to all chatter: party replies, General reactions,
+#       idle conversations, event reactions. Direct replies
+#       to player chat use a faster 2-second floor but still
+#       respect this minimum. Lower = snappier replies.
+#       Default: 1000
+#
+LLMChatter.MessageDelayMin = 1000
+
+#
+#   LLMChatter.MessageDelayMax
+#       Maximum delay (milliseconds) before a bot sends a
+#       message. Ambient and idle messages use longer delays
+#       within this range for natural pacing. Multi-message
+#       conversations stagger each followup by 2-5 seconds.
+#       Default: 30000
+#
+LLMChatter.MessageDelayMax = 30000
+
+#
+# PARTY CHAT PACING GATE [BRIDGE]
+#
+#   LLMChatter.PartyGate.Enable
+#       Enables a single per-party delivery gate for Python-generated
+#       party chat messages. This prevents idle, flavor, and contextual
+#       chatter from appearing as a burst when several systems trigger
+#       close together. C++ pre-cache instant reactions are not delayed.
+#       Default: 1
+#
+LLMChatter.PartyGate.Enable = 1
+
+#
+#   LLMChatter.PartyGate.FillerMinGapSeconds
+#       Minimum visible gap after filler party chat such as idle chatter,
+#       bot questions, screenshot observations, and nearby flavor.
+#       Default: 12
+#
+LLMChatter.PartyGate.FillerMinGapSeconds = 12
+
+#
+#   LLMChatter.PartyGate.ContextualMinGapSeconds
+#       Minimum visible gap after normal contextual party reactions such
+#       as zone transitions, quests, loot, level-ups, and greetings.
+#       Default: 10
+#
+LLMChatter.PartyGate.ContextualMinGapSeconds = 10
+
+#
+#   LLMChatter.PartyGate.ResponsiveMinGapSeconds
+#       Minimum visible gap for player-directed replies. Keep this low so
+#       bots still feel responsive when the player speaks to them.
+#       Default: 4
+#
+LLMChatter.PartyGate.ResponsiveMinGapSeconds = 4
+
+#
+#   LLMChatter.PartyGate.UrgentMinGapSeconds
+#       Minimum visible gap after urgent generated reactions. Set to 0 to
+#       avoid delaying combat/state feedback.
+#       Default: 0
+#
+LLMChatter.PartyGate.UrgentMinGapSeconds = 0
+
+#
+#   LLMChatter.PartyGate.PreLLMDeferThresholdSeconds
+#       Filler systems skip the LLM call when the group's next party-chat
+#       slot is farther than this many seconds away. They will try again
+#       on a later timer tick instead of spending tokens immediately.
+#       Default: 4
+#
+LLMChatter.PartyGate.PreLLMDeferThresholdSeconds = 4
+
+#
+#   LLMChatter.PartyGate.MaxFillerDelaySeconds
+#       Maximum post-LLM delay applied to already-generated filler
+#       messages. Generated messages are deferred, not dropped.
+#       Default: 45
+#
+LLMChatter.PartyGate.MaxFillerDelaySeconds = 45
+
+#
+#   LLMChatter.PartyGate.DebugLog
+#       Log party gate reservations and pre-LLM deferrals.
+#       Default: 0
+#
+LLMChatter.PartyGate.DebugLog = 0
+
+#
+#   LLMChatter.DistanceUnit
+#       Unit for distances shown in LLM prompts
+#       "yards" (WoW native) or "meters"
+#       Default: yards
+#
+LLMChatter.DistanceUnit = yards
+
+#
+#   LLMChatter.BotSpeakerCooldownSeconds
+#       Per-bot cooldown (seconds) for General channel speech.
+#       After a bot speaks in General, it cannot speak again
+#       until this cooldown expires. Spreads voices across
+#       different bots so the same one doesn't dominate.
+#       Does NOT affect party chat or event reactions.
+#       Default: 900 (15 minutes)
+#
+LLMChatter.BotSpeakerCooldownSeconds = 120
+
+#
+#   LLMChatter.EventExpirationSeconds
+#       How long (seconds) before unprocessed events expire
+#       Default: 600 (10 minutes)
+#
+LLMChatter.EventExpirationSeconds = 600
+
+#
+#   LLMChatter.BGChatter.MaxTokens
+#       Max response tokens for BG chatter prompts.
+#       Lower values keep battleground lines brief.
+#       Must be high enough to avoid truncating the
+#       JSON wrapper (message+emote+action fields).
+#       Minimum safe value is ~150.
+#       Default: 300
+#
+LLMChatter.BGChatter.MaxTokens = 300
+
+#
+#   BG arrival greetings [BRIDGE]
+#       Always select one BG-wide greeting when enabled and bots exist.
+#       A second BG-wide greeting has ArrivalRaidSecondChance percent chance.
+#       Independently roll a uniform Party count from ArrivalPartyMin to Max.
+#       Counts are capped by subgroup bots. A bot may speak once per channel.
+#       Generation and delivery guards still apply.
+#
+LLMChatter.BGChatter.ArrivalGreetings.Enable = 1
+LLMChatter.BGChatter.ArrivalRaidSecondChance = 50
+LLMChatter.BGChatter.ArrivalPartyMin = 0
+LLMChatter.BGChatter.ArrivalPartyMax = 3
+
+#
+#   LLMChatter.BGChatter.FlagRegrabWindowSec
+#       [BRIDGE] A flag pickup by the same player who dropped
+#       that flag within this many seconds is treated as a
+#       re-grab and gets no callout, so one carry that briefly
+#       drops the flag does not spam BG chat. 0 disables.
+#       Default: 15
+#
+LLMChatter.BGChatter.FlagRegrabWindowSec = 15
+
+#
+#   LLMChatter.BGChatter.AchievementCooldownSec
+#       [BRIDGE] Minimum seconds between achievement reactions for
+#       the same group inside a battleground. Early in a match
+#       everyone earns honorable-kill achievements at once; this
+#       keeps them from flooding party chat. 0 disables.
+#       Default: 45
+#
+LLMChatter.BGChatter.AchievementCooldownSec = 45
+
+#
+#   LLMChatter.BGChatter.AchievementRepeatWindowSec
+#       [BRIDGE] Once an achievement got a reaction in a
+#       battleground, the same achievement earned by other
+#       teammates is ignored for this many seconds (e.g. "Know
+#       Thy Enemy" earned bot after bot). 0 disables.
+#       Default: 300
+#
+LLMChatter.BGChatter.AchievementRepeatWindowSec = 300
+
+#
+#   LLMChatter.BGChatter.IdleChatterChance
+#       Percent chance (0-100) that bots chat during quiet
+#       stretches in a battleground. Checked each poll cycle
+#       after the idle cooldown expires.
+#       Default: 25
+#
+LLMChatter.BGChatter.IdleChatterChance = 15
+
+#
+#   LLMChatter.BGChatter.IdleChatterCooldownSec
+#       Minimum seconds between BG idle chatter triggers
+#       for the same battleground instance.
+#       Default: 30
+#
+LLMChatter.BGChatter.IdleChatterCooldownSec = 30
+
+#
+#   LLMChatter.BGChatter.FlagCarryChatterIntervalSec
+#       [SERVER] While a Warsong Gulch flag is being carried, how
+#       often (seconds) the team may talk about the ongoing carry:
+#       encouraging your carrier, hunting theirs, or a standoff.
+#       The first line waits at least this long after a pickup.
+#       0 disables.
+#       Default: 45
+#
+LLMChatter.BGChatter.FlagCarryChatterIntervalSec = 45
+
+#
+#   LLMChatter.BGChatter.FlagCarryChatterChance
+#       [SERVER] Percent chance (0-100) that each carry-chatter
+#       interval actually produces a line, so the cadence is not
+#       predictable.
+#       Default: 50
+#
+LLMChatter.BGChatter.FlagCarryChatterChance = 50
+
+#
+#   LLMChatter.BGChatter.FlagCarryBGChannelChance
+#       [BRIDGE] Percent chance (0-100) that an ongoing flag-carry
+#       line is said in battleground chat by a teammate outside
+#       your sub-group, instead of in party chat.
+#       Default: 70
+#
+LLMChatter.BGChatter.FlagCarryBGChannelChance = 70
+
+#
+#   LLMChatter.BGChatter.RezChance
+#       Percent chance (0-100) that a resurrection spell
+#       triggers a callout in a battleground. Rezzes are
+#       constant in BG combat, so a low value prevents
+#       "X is back in the fight" spam. Outside BGs,
+#       resurrections always trigger (100%).
+#       Default: 20
+#
+LLMChatter.BGChatter.RezChance = 20
+
+#
+#   LLMChatter.PrioritySystem.SafetyEnable
+#       Reserved for future use. Currently all chatter flows
+#       freely — the bridge handles load via per-system
+#       singleton workers and config-driven RNG/cooldowns.
+#       Default: 1
+#
+LLMChatter.PrioritySystem.SafetyEnable = 1
+
+###############################################################################
+# BOT PERSISTENT MEMORY & PERSONALITIES [BRIDGE]
+#
+#   Bots accumulate memories of moments shared with each player and
+#   surface them as reunion greetings in future sessions. Personalities
+#   (traits + farewell) are generated once and reused across sessions.
+#
+###############################################################################
+
+#
+#   LLMChatter.Memory.Enable
+#       Master toggle for the persistent memory system.
+#       When disabled, no memories are generated or surfaced.
+#       Default: 1 (enabled)
+#
+LLMChatter.Memory.Enable = 1
+
+#
+#   LLMChatter.Memory.AmbientChance
+#       Percent chance (0-100) per zone/subzone transition that
+#       an ambient memory is generated for a random bot.
+#       Default: 20
+#
+LLMChatter.Memory.AmbientChance = 20
+
+#
+#   LLMChatter.Memory.RecallChance
+#       Percent chance (0-100) that a returning bot references
+#       a specific past memory in its reunion greeting.
+#       Default: 20
+#
+LLMChatter.Memory.RecallChance = 20
+
+#
+#   LLMChatter.Memory.SessionMinutes
+#       Minimum session length (minutes) before memories are
+#       committed on farewell. Shorter sessions are discarded.
+#       Set low enough to capture normal play sessions (dungeon
+#       runs, quests) without discarding meaningful moments.
+#       Default: 3
+#
+LLMChatter.Memory.SessionMinutes = 3
+
+#
+#   LLMChatter.Memory.MaxPerBotPlayer
+#       Maximum active memories per bot-player pair. Used
+#       memories are evicted to make room for new ones.
+#       Default: 30
+#
+LLMChatter.Memory.MaxPerBotPlayer = 30
+
+#
+#   LLMChatter.Memory.IdentityVersion
+#       Bump this to force all bots to regenerate their
+#       persistent personality (traits + farewell). Useful
+#       after prompt or trait system changes.
+#       Default: 1
+#
+LLMChatter.Memory.IdentityVersion = 1
+
+#
+#   LLMChatter.Memory.PlayerMsgMaxLength
+#       Maximum character length of a player message that
+#       can trigger a player_message memory. Longer messages
+#       are skipped.
+#       Default: 200
+#
+LLMChatter.Memory.PlayerMsgMaxLength = 200
+
+#
+#   LLMChatter.Memory.PlayerMsgMaxPerSession
+#       Maximum player_message memories generated per session.
+#       Prevents memory spam in chatty sessions.
+#       Default: 3
+#
+LLMChatter.Memory.PlayerMsgMaxPerSession = 3
+
+#
+#   LLMChatter.Memory.QuestGenerationChance
+#       Percent chance (0-100) that a quest completion
+#       event generates a persistent memory.
+#       Default: 40
+#
+LLMChatter.Memory.QuestGenerationChance = 40
+
+#
+#   LLMChatter.Memory.AchievementGenerationChance
+#       Percent chance (0-100) that an achievement event
+#       generates a persistent memory.
+#       Default: 60
+#
+LLMChatter.Memory.AchievementGenerationChance = 60
+
+#
+#   LLMChatter.Memory.LevelUpGenerationChance
+#       Percent chance (0-100) that a level-up event
+#       generates a persistent memory.
+#       Default: 60
+#
+LLMChatter.Memory.LevelUpGenerationChance = 60
+
+#
+#   LLMChatter.Memory.BGMatchGenerationChance
+#       Percent chance (0-100) that a BG match result
+#       generates a persistent memory.
+#       Default: 45
+#
+LLMChatter.Memory.BGMatchGenerationChance = 45
+
+#
+#   LLMChatter.Memory.PvPKillGenerationChance
+#       Percent chance (0-100) that a PvP kill event
+#       generates a persistent memory.
+#       Default: 30
+#
+LLMChatter.Memory.PvPKillGenerationChance = 30
+
+#
+#   LLMChatter.Memory.BossKillGenerationChance
+#       Percent chance (0-100) that a boss or rare kill
+#       generates a persistent memory.
+#       Default: 70
+#
+LLMChatter.Memory.BossKillGenerationChance = 70
+
+#
+#   LLMChatter.Memory.DungeonGenerationChance
+#       Percent chance (0-100) that entering a dungeon
+#       generates a persistent memory.
+#       Default: 60
+#
+LLMChatter.Memory.DungeonGenerationChance = 60
+
+#
+#   LLMChatter.Memory.WipeGenerationChance
+#       Percent chance (0-100) that a party wipe
+#       generates a persistent memory for the bot.
+#       Default: 80
+#
+LLMChatter.Memory.WipeGenerationChance = 80
+
+#
+#   LLMChatter.Memory.PartyMemberGenerationChance
+#       Percent chance (0-100) that a farewell
+#       generates a persistent memory about
+#       adventuring with party companions.
+#       Default: 50
+#
+LLMChatter.Memory.PartyMemberGenerationChance = 50
+
+#
+#   LLMChatter.Memory.IdleRecallChance
+#       Percent chance (0-100) that idle chatter or bot
+#       questions surface a past memory for context.
+#       Default: 20
+#
+LLMChatter.Memory.IdleRecallChance = 20
+
+###############################################################################
+# BACKSTORY
+###############################################################################
+
+#
+#   LLMChatter.Backstory.Enable [BRIDGE]
+#       Master switch for bot background stories.
+#       When enabled, an LLM-generated backstory is
+#       created for each bot when they join a group.
+#       The backstory is persistent across sessions.
+#       Requires bridge restart to take effect.
+#       Default: 1
+#
+LLMChatter.Backstory.Enable = 1
+
+#
+#   LLMChatter.Backstory.IdleChance [BRIDGE]
+#       Percent chance (0-100) that a bot's backstory
+#       is included in idle chatter prompts.
+#       Higher values mean more backstory-influenced
+#       idle messages.
+#       Requires bridge restart to take effect.
+#       Default: 25
+#
+LLMChatter.Backstory.IdleChance = 25
+
+#
+#   LLMChatter.Backstory.PartyReactionChance [BRIDGE]
+#       Percent chance (0-100) that a party bot's backstory is included
+#       when it reacts to a party event (kills, loot, deaths, level-ups,
+#       quests, zone changes...) or replies to the player, including
+#       each speaker in multi-bot party conversations. Roleplay mode
+#       only; quick casual replies never include it. Lower it to save
+#       prompt tokens (roughly 50-150 per bot).
+#       Requires bridge restart to take effect.
+#       Default: 50
+#
+LLMChatter.Backstory.PartyReactionChance = 50
+
+#
+#   LLMChatter.Backstory.ProximityChance [BRIDGE]
+#       Percent chance (0-100) that a bot's backstory
+#       is included in proximity chatter prompts.
+#       Requires bridge restart to take effect.
+#       Default: 15
+#
+LLMChatter.Backstory.ProximityChance = 15
+
+#
+#   LLMChatter.Backstory.GeneralChance [BRIDGE]
+#       Independent chance per General speaker to include their backstory.
+#       Traits and tone are always included. Roleplay only. Range: 0-100.
+#       Does not affect profile creation or storage.
+#       Requires bridge restart to take effect.
+#       Default: 25
+#
+LLMChatter.Backstory.GeneralChance = 25
+
+#
+#   LLMChatter.Backstory.GuildChance [BRIDGE]
+#       Independent chance per Guild speaker to include their backstory.
+#       Traits and tone are always included. Roleplay only. Range: 0-100.
+#       Does not affect profile creation or storage.
+#       Requires bridge restart to take effect.
+#       Default: 25
+#
+LLMChatter.Backstory.GuildChance = 25
+
+#
+#   LLMChatter.Profile.GuildScanIntervalSeconds [BRIDGE]
+#       Poll for missing profiles in guilds with an online real-player session.
+#       One background batch at a time; bot-only guilds are excluded.
+#       Requires bridge restart to take effect.
+#       Default: 15
+#
+LLMChatter.Profile.GuildScanIntervalSeconds = 15
+
+#
+#   LLMChatter.Profile.GuildBatchSize [BRIDGE]
+#       Maximum profiles prepared per scan (1-100). Existing guild members
+#       are backfilled at this rate; selected speakers are also ensured.
+#       Requires bridge restart to take effect.
+#       Default: 2
+#
+LLMChatter.Profile.GuildBatchSize = 2
+
+#
+#   LLMChatter.Profile.RetrySeconds [BRIDGE]
+#       Retry delay after failed profile persistence or LLM generation.
+#       Successful fields are retained. Minimum: 1 second.
+#       Requires bridge restart to take effect.
+#       Default: 300
+#
+LLMChatter.Profile.RetrySeconds = 300
+
+#
+#   LLMChatter.Persona.TwistChance [BRIDGE]
+#       Percent chance (0-100) that a prompt gets an
+#       optional creative angle. The angle is framed as
+#       "use only if it fits your personality".
+#       Requires bridge restart to take effect.
+#       Default: 25
+#
+LLMChatter.Persona.TwistChance = 25
+
+#
+#   LLMChatter.Persona.SpiceChance [BRIDGE]
+#       Percent chance (0-100) that a prompt gets
+#       background feelings ("spices") at all. Spices
+#       are framed as texture that must fit the bot's
+#       personality. 0 disables them.
+#       Requires bridge restart to take effect.
+#       Default: 30
+#
+LLMChatter.Persona.SpiceChance = 30
+
+#
+#   LLMChatter.PersonalitySpiceCount [BRIDGE]
+#       How many background feelings a prompt gets when
+#       the SpiceChance roll passes (0-5). 0 disables
+#       spices.
+#       Requires bridge restart to take effect.
+#       Default: 2
+#
+LLMChatter.PersonalitySpiceCount = 2
+
+#
+#   LLMChatter.Threads.Enable [BRIDGE]
+#       1 = party idle chatter follows conversation threads.
+#       0 = previous behaviour (random topic per exchange).
+#       Default: 1
+#
+LLMChatter.Threads.Enable = 1
+
+#
+#   LLMChatter.Threads.GuildEnable [BRIDGE]
+#   LLMChatter.Threads.GeneralEnable [BRIDGE]
+#       Per-channel switches under Threads.Enable. Guild chat keeps one
+#       thread per guild; the General channel keeps one per zone and
+#       faction (Alliance and Horde each have their own General). Their
+#       ambient lines follow the thread, and replies to the player see
+#       it. 0 = that channel keeps the random-topic behaviour.
+#       Defaults: 1 / 1
+#
+LLMChatter.Threads.GuildEnable = 1
+
+LLMChatter.Threads.GeneralEnable = 1
+
+#
+#   LLMChatter.Threads.HistorySize [BRIDGE]
+#       How many finished subjects a party remembers for callbacks
+#       ("about what you said earlier"). Range 1-10.
+#       Default: 5
+#
+LLMChatter.Threads.HistorySize = 5
+
+#
+#   LLMChatter.Threads.ExchangeDecay [BRIDGE]
+#       Percent (10-95) of a subject's remaining energy kept after each
+#       exchange when the model does not report it. Higher = stickier
+#       subjects.
+#       Default: 70
+#
+LLMChatter.Threads.ExchangeDecay = 70
+
+#
+#   LLMChatter.Threads.CoolMinutes [BRIDGE]
+#       Minutes of silence that halve a subject's energy (1-240), so an
+#       old subject is not picked up as if no time had passed.
+#       Default: 15
+#
+LLMChatter.Threads.CoolMinutes = 15
+
+#
+#   LLMChatter.Threads.FeelingTurns [BRIDGE]
+#       How many following exchanges a bot's lingering feeling stays in
+#       the prompt (1-10).
+#       Default: 3
+#
+LLMChatter.Threads.FeelingTurns = 3
+
+#
+#   LLMChatter.Threads.PersonaTopicWeight [BRIDGE]
+#   LLMChatter.Threads.SurroundingsTopicWeight [BRIDGE]
+#   LLMChatter.Threads.PoolTopicWeight [BRIDGE]
+#       Relative weights (0-100) for where a fresh subject comes from:
+#       something a bot personally cares about (traits, backstory,
+#       race/class), the surroundings, or the random topic pool. The
+#       pool is never used inside dungeons or battlegrounds.
+#       Defaults: 60 / 30 / 10
+#
+LLMChatter.Threads.PersonaTopicWeight = 60
+LLMChatter.Threads.SurroundingsTopicWeight = 30
+LLMChatter.Threads.PoolTopicWeight = 10
+
+#
+#   LLMChatter.Threads.SurpriseChance [BRIDGE]
+#       Percent chance (0-100) that an exchange explicitly allows a
+#       believable surprise: a bot changing its mind, going off on a
+#       tangent, revealing something or taking an unexpected stance.
+#       Default: 12
+#
+LLMChatter.Threads.SurpriseChance = 12
+
+#
+#   LLMChatter.Threads.HighEnergyThreshold [BRIDGE]
+#   LLMChatter.Threads.LowEnergyThreshold [BRIDGE]
+#       Energy bands (percent) that pick which move weights apply to
+#       the current subject: at or above High uses HighEnergyMoveWeights,
+#       at or above Low uses MidEnergyMoveWeights, below uses
+#       LowEnergyMoveWeights. Low must be below High.
+#       Defaults: 60 / 30
+#
+LLMChatter.Threads.HighEnergyThreshold = 60
+LLMChatter.Threads.LowEnergyThreshold = 30
+
+#
+#   LLMChatter.Threads.HighEnergyMoveWeights [BRIDGE]
+#   LLMChatter.Threads.MidEnergyMoveWeights [BRIDGE]
+#   LLMChatter.Threads.LowEnergyMoveWeights [BRIDGE]
+#       Relative weights "continue,drift,callback,new" (four numbers,
+#       0-100 each, not all zero) for the soft nudge in each energy
+#       band. Callback weight moves to "new" while no earlier subject
+#       exists. Invalid values fall back to the defaults.
+#       Defaults: 70,20,5,5 / 35,35,15,15 / 10,25,25,40
+#
+LLMChatter.Threads.HighEnergyMoveWeights = 70,20,5,5
+LLMChatter.Threads.MidEnergyMoveWeights = 35,35,15,15
+LLMChatter.Threads.LowEnergyMoveWeights = 10,25,25,40
+
+#
+#   LLMChatter.Threads.PendingTimeoutSeconds [BRIDGE]
+#       An idle exchange only becomes part of the thread once every line
+#       it queued was actually sent in game. Lines still unsent after
+#       this many seconds (30-3600) count as dropped, even if the
+#       delivery status cannot be read.
+#       Default: 300
+#
+LLMChatter.Threads.PendingTimeoutSeconds = 300
+
+#
+#   LLMChatter.Threads.MaxPending [BRIDGE]
+#       Maximum unconfirmed idle exchanges held per party (1-50); the
+#       oldest is discarded first.
+#       Default: 6
+#
+LLMChatter.Threads.MaxPending = 6
+
+#
+#   LLMChatter.Threads.IdleTTLMinutes [BRIDGE]
+#       Minutes without any activity after which a party's threads are
+#       forgotten (10-1440). Ended parties are also forgotten on the next
+#       idle tick.
+#       Default: 180
+#
+LLMChatter.Threads.IdleTTLMinutes = 180
+
+#
+#   LLMChatter.Threads.MaxGroups [BRIDGE]
+#       Maximum parties kept in thread memory (1-5000); the least
+#       recently active party is dropped first.
+#       Default: 200
+#
+LLMChatter.Threads.MaxGroups = 200
+
+#
+#   LLMChatter.Threads.MaxInterruptions [BRIDGE]
+#       How many recent player lines and events (1-10) the next idle
+#       exchange is told about.
+#       Default: 4
+#
+LLMChatter.Threads.MaxInterruptions = 4
+
+#
+#   LLMChatter.Threads.ReportTokens [BRIDGE]
+#       Extra output tokens (40-400) reserved for the model's thread
+#       report so it never truncates the chat line before it.
+#       Default: 90
+#
+LLMChatter.Threads.ReportTokens = 90
+
+###############################################################################
+# EMOTE REACTION SYSTEM
+###############################################################################
+
+#
+#   LLMChatter.EmoteReactions.Enable
+#       Master switch for the emote reaction system.
+#       When disabled, no emote-triggered reactions fire at all.
+#       Default: 1
+#
+LLMChatter.EmoteReactions.Enable = 1
+
+#
+#   LLMChatter.EmoteReactions.MirrorChance
+#       Percent chance (0-100) that a grouped bot silently mirrors
+#       an emote directed at it (e.g. /wave → bot waves back).
+#       Also used for NPC mirror chance.
+#       Default: 80
+#
+LLMChatter.EmoteReactions.MirrorChance = 80
+
+#
+#   LLMChatter.EmoteReactions.MirrorCooldown
+#       Seconds before the same bot can mirror an emote again.
+#       Also controls the minimum interval for NPC mirrors.
+#       Grouped and ungrouped bot verbal cooldowns use twice this value.
+#       Default: 15
+#
+LLMChatter.EmoteReactions.MirrorCooldown = 15
+
+#
+#   LLMChatter.EmoteReactions.ReactionChance
+#       Independent percent chance (0-100) that a grouped bot adds a
+#       verbal LLM comment after a social emote is directed at it.
+#       Default: 80
+#
+LLMChatter.EmoteReactions.ReactionChance = 80
+
+#
+#   LLMChatter.EmoteReactions.UngroupedBotMirrorChance
+#       Independent chance (0-100) that an eligible playerbot outside the
+#       player's group mirrors a directed emote. Uses the shared per-bot
+#       MirrorCooldown.
+#       Default: 80
+#
+LLMChatter.EmoteReactions.UngroupedBotMirrorChance = 80
+
+#
+#   LLMChatter.EmoteReactions.UngroupedBotVerbalReactionChance
+#       Independent chance (0-100) that an eligible playerbot outside the
+#       player's group answers a directed emote in local /say. The per-player
+#       and bot cooldown is twice MirrorCooldown.
+#       Default: 80
+#
+LLMChatter.EmoteReactions.UngroupedBotVerbalReactionChance = 80
+
+#
+#   LLMChatter.EmoteReactions.UngroupedBotWitnessReactionChance
+#       Independent chance (0-100) to let one or two compatible nearby NPCs
+#       or ungrouped playerbots comment when the addressed playerbot does not
+#       verbally react. The witnesses share the original emote context.
+#       Default: 50
+#
+LLMChatter.EmoteReactions.UngroupedBotWitnessReactionChance = 50
+
+#
+#   LLMChatter.EmoteReactions.ObserverChance
+#       Percent chance (0-100) that a nearby bot comments when
+#       the player emotes at an NPC, stranger, or nobody.
+#       Default: 50
+#
+LLMChatter.EmoteReactions.ObserverChance = 50
+
+#
+#   LLMChatter.EmoteReactions.PartyObserverExchangeChance [BRIDGE]
+#       When a party bot chimes in on the player's emote at another
+#       party bot, percent chance (0-100) that it becomes a short
+#       two-line exchange: the observer remarks and the targeted bot
+#       answers it. Otherwise a single comment.
+#       Default: 35
+#
+LLMChatter.EmoteReactions.PartyObserverExchangeChance = 25
+
+#
+#   LLMChatter.EmoteReactions.PartyBotWitnessChance [SERVER]
+#       Percent chance (0-100) that nearby NPCs or playerbots outside
+#       the party witness the player's emote at a party bot and react
+#       in /say (proximity chatter must be enabled). The party bot
+#       itself answers in party chat.
+#       Default: 30
+#
+LLMChatter.EmoteReactions.PartyBotWitnessChance = 20
+
+#
+#   LLMChatter.EmoteReactions.ObserverCooldown
+#       Seconds before the same group can trigger another
+#       observer comment.
+#       Default: 30
+#
+LLMChatter.EmoteReactions.ObserverCooldown = 0
+
+#
+#   LLMChatter.EmoteReactions.MoodSpreadChance
+#       Percent chance (0-100) that a contagious emote
+#       (dance, cheer, laugh) spreads to other nearby bots.
+#       Currently unimplemented — reserved for future use.
+#       Default: 50
+#
+LLMChatter.EmoteReactions.MoodSpreadChance = 50
+
+#
+#   LLMChatter.EmoteReactions.NPCMirrorEnable
+#       When enabled, NPCs the player emotes at will mirror
+#       the emote back with a short delay (if alive, not in
+#       combat, not hostile, and not a boss-rank creature).
+#       Default: 1
+#
+LLMChatter.EmoteReactions.NPCMirrorEnable = 1
+
+#
+#   LLMChatter.EmoteReactions.CustomEnable
+#       React to free-text emotes typed as /e or /me
+#       ("/e grabs hand"), not just the ~244 named emotes
+#       like /point and /salute. The typed text is passed to
+#       the model as the action.
+#       Because a custom emote has no emote id, bots can only
+#       answer verbally: there is no animation to mirror, and
+#       NPC mirroring stays named-emote only. The target is
+#       taken from whoever the player has selected, since the
+#       client sends no target with a custom emote.
+#       Requires LLMChatter.EmoteReactions.Enable.
+#       Default: 1
+#
+LLMChatter.EmoteReactions.CustomEnable = 1
+
+#
+#   LLMChatter.EmoteReactions.CustomMaxChars
+#       Clamp for the typed emote text before it reaches the
+#       prompt, counted in characters (not bytes), so non-ASCII
+#       text gets the same length. Longer emotes are cut at a
+#       character boundary.
+#       Default: 120
+#
+LLMChatter.EmoteReactions.CustomMaxChars = 120
+
+#
+#   LLMChatter.EmoteReactions.NPCVerbalReactionChance
+#       Independent chance (0-100) that an eligible NPC verbally reacts
+#       when a player directs a social emote at it.
+#       Default: 80
+#
+LLMChatter.EmoteReactions.NPCVerbalReactionChance = 80
+
+#
+#   LLMChatter.EmoteReactions.NPCVerbalCooldown
+#       Seconds between verbal emote reactions for the same player/NPC
+#       pair. This is independent from the mirror animation cooldown.
+#       Clamped to 0-3 seconds so directed interaction stays responsive.
+#       Default: 3
+#
+LLMChatter.EmoteReactions.NPCVerbalCooldown = 3
+
+#
+#   LLMChatter.EmoteReactions.CxxScriptExclusionEntries
+#       Creature entries whose C++ scripts own ReceiveEmote behavior.
+#       NPC mirror and generated NPC verbal reactions are suppressed
+#       for these entries to avoid duplicate direct responses.
+#       Default: 620,25305,33211,33224,6626,7233,3401
+#
+LLMChatter.EmoteReactions.CxxScriptExclusionEntries = 620,25305,33211,33224,6626,7233,3401
+
+#
+#   LLMChatter.GearContext.Enable
+#       [BRIDGE]
+#       Tell bots what they are actually carrying: the
+#       equipped main hand, off hand and ranged items by
+#       name and type, plus the pet of a hunter or warlock
+#       by name and species. Without it a bot invents its
+#       gear, talking about a sword while holding a mace,
+#       or treats its own pet as a stranger.
+#       Applies to party chatter, emote reactions and
+#       ambient chatter. Reads the character database and
+#       caches per bot, so the cost is one small query
+#       every few minutes rather than one per message.
+#       Default: 1 (enabled)
+#
+LLMChatter.GearContext.Enable = 1
+
+###############################################
+# Screenshot Vision Feature (Experimental)
+# Requires screenshot_agent.py running on host
+# See README.md > Screenshot Vision for setup
+###############################################
+
+#
+#   LLMChatter.Screenshot.Enable
+#       Master switch for screenshot vision observations.
+#       The host-side screenshot_agent.py must also be
+#       running for this feature to function.
+#       Default: 0 (disabled)
+#
+LLMChatter.Screenshot.Enable = 0
+
+#
+#   LLMChatter.Screenshot.DBHost
+#       MySQL host for the screenshot agent, which runs
+#       on the host machine (not inside Docker). Use
+#       127.0.0.1 when MySQL is exposed on localhost.
+#       If unset, falls back to LLMChatter.Database.Host,
+#       which is usually a Docker-internal hostname.
+#       Default: 127.0.0.1
+#
+LLMChatter.Screenshot.DBHost = 127.0.0.1
+
+#
+#   LLMChatter.Screenshot.IntervalMinSeconds
+#   LLMChatter.Screenshot.IntervalMaxSeconds
+#       Random interval range (seconds) between capture
+#       attempts. With 90% chance, this produces roughly
+#       one observation every 1-3 minutes.
+#       Default: 45 / 120
+#
+LLMChatter.Screenshot.IntervalMinSeconds = 45
+LLMChatter.Screenshot.IntervalMaxSeconds = 120
+
+#
+#   LLMChatter.Screenshot.Chance
+#       Chance (1-100) to actually process a capture when
+#       the interval fires. Even if the timer triggers,
+#       the capture may be skipped based on this roll.
+#       Default: 90
+#
+LLMChatter.Screenshot.Chance = 40
+
+#
+#   LLMChatter.Screenshot.VisionProvider
+#       Which AI provider to use for screenshot analysis.
+#       Format: one lowercase name with no quotes.
+#       Values: openai (recommended), anthropic, google, or openrouter.
+#       Ollama is not supported by the screenshot agent.
+#       Requires the matching provider API key above.
+#       Default: openai
+#
+LLMChatter.Screenshot.VisionProvider = openai
+
+#
+#   LLMChatter.Screenshot.VisionModel
+#       Vision model used for screenshot analysis.
+#       Format: an exact vision-capable API model ID with no quotes. Use a
+#       vendor/model slug when VisionProvider is openrouter.
+#       Recommended: gpt-6-luna (fast, inexpensive, good vision)
+#       Alternatives: gpt-4o-mini, claude-haiku-4-5-20251001,
+#       gemini-3.1-flash-lite, gemini-2.5-flash,
+#       anthropic/claude-haiku-4.5 (OpenRouter)
+#       Default: gpt-6-luna
+#
+LLMChatter.Screenshot.VisionModel = gpt-6-luna
+
+#
+#   LLMChatter.Screenshot.ConversationChance
+#       Chance (1-100) that a screenshot observation
+#       triggers a multi-bot conversation instead of a
+#       single comment. Requires at least 2 bots in the
+#       group.
+#       Default: 40
+#
+LLMChatter.Screenshot.ConversationChance = 25
+
+#
+#   LLMChatter.Screenshot.MaxWidthPx
+#       Maximum width in pixels for the screenshot before
+#       sending to the vision API. Lower values reduce
+#       upload time and cost, higher values improve detail.
+#       1280 is a good balance.
+#       Default: 1280
+#
+LLMChatter.Screenshot.MaxWidthPx = 1024
+
+#
+#   LLMChatter.Screenshot.JpegQuality
+#       JPEG compression quality (1-100) for the
+#       screenshot payload. Lower values reduce file size,
+#       higher values preserve detail.
+#       Default: 75
+#
+LLMChatter.Screenshot.JpegQuality = 75
+
+#
+#   LLMChatter.Screenshot.BoundAccountId
+#       Bind observations to the account in the captured WoW window.
+#       Required for multi-player servers and always required for NPC
+#       proximity. Zero auto-detects a group for Party only.
+#       Consumed by host and worldserver: restart host and reload server
+#       config after edits. Find your ID in acore_auth.account.
+#       Default: 0 (Party auto-detection; NPC proximity unavailable)
+#
+LLMChatter.Screenshot.BoundAccountId = 0
+
+#
+#   LLMChatter.Screenshot.Proximity.Enable
+#       Enable screenshot-triggered nearby NPC chatter independently of
+#       Party, including while solo. Requires the characters migration,
+#       ProximityChatter.Enable and an explicit Screenshot.BoundAccountId.
+#       Host and worldserver setting: restart host and reload server config.
+#       Default: 0 (disabled)
+#
+LLMChatter.Screenshot.Proximity.Enable = 0
+
+#
+#   LLMChatter.Screenshot.Proximity.Chance
+#       Host-side chance after the existing Screenshot.Chance cycle roll.
+#       Party has no additional roll. Range: 0-100. Restart the host agent.
+#       Default: 30
+#
+LLMChatter.Screenshot.Proximity.Chance = 30
+
+#
+#   LLMChatter.Screenshot.Proximity.PollIntervalMs
+#       Worldserver mailbox polling interval. Clamped to 100-10000 ms.
+#       Reload server config after changing this setting.
+#       Default: 1000
+#
+LLMChatter.Screenshot.Proximity.PollIntervalMs = 1000
+
+#
+#   LLMChatter.Screenshot.Proximity.RequestTimeoutSeconds
+#       Host wait for server preflight. Clamped to 1-30 seconds.
+#       Restart the host agent after changing this setting.
+#       Default: 5
+#
+LLMChatter.Screenshot.Proximity.RequestTimeoutSeconds = 5
+
+#
+#   LLMChatter.Screenshot.Proximity.MaxAgeSeconds
+#       Server preflight-to-consumption lifetime, clamped to 5-300 seconds.
+#       Final speech uses normal event expiry plus live session/range checks.
+#       Reload server config after changing this setting.
+#       Default: 60
+#
+LLMChatter.Screenshot.Proximity.MaxAgeSeconds = 60

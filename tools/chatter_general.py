@@ -1,0 +1,1850 @@
+"""
+Chatter General - General channel reactions.
+
+When a real player types in General channel, nearby
+bots react with statements or conversations, making
+the world feel alive and interactive.
+
+Zone-scoped: history per zone, cooldowns per zone,
+bot selection by zone.
+"""
+
+import logging
+import random
+
+# Module-level config defaults (set by init_general_config)
+_chat_history_limit = 10
+_extended_conv_chance = 40
+_extended_max_messages = 3
+
+from chatter_shared import (
+    call_llm, cleanup_message, strip_speaker_prefix,
+    get_chatter_mode, get_class_name, get_race_name,
+    get_race_faction,
+    get_gender_label,
+    build_race_class_context, parse_extra_data,
+    calculate_dynamic_delay,
+    find_addressed_bot,
+    should_reply_to_optional_casual,
+    build_conversational_scale_guidance,
+    brief_casual_length_line,
+    brief_casual_response_fits,
+    build_brief_casual_repair_prompt,
+    pick_brief_casual_tier,
+    insert_chat_message,
+    build_anti_repetition_context,
+    get_recent_zone_messages,
+    append_json_instruction,
+    parse_single_response,
+    should_include_action,
+    _extend_zone_delivery_window,
+    get_zone_flavor,
+    get_zone_name,
+    get_player_zone,
+    build_zone_metadata,
+    build_talent_context,
+    shorten_chat_message,
+)
+from chatter_prompts import (
+    maybe_get_creative_twist,
+    build_environmental_context_lines,
+    maybe_pick_personality_spices,
+    format_spices_line,
+    TWIST_LABEL,
+)
+from chatter_threads import (
+    general_key,
+    note_player_message,
+    render_for_player_reply,
+)
+from chatter_general_length import (
+    general_reply_length_line, pick_general_reply_tier,
+)
+from chatter_identity import prepare_channel_persona
+from chatter_persona import (
+    Persona,
+    build_persona_block,
+    persona_from_fields,
+)
+from chatter_mode import (
+    build_player_chat_guidance,
+    build_player_identity,
+)
+from chatter_constants import (
+    RACE_SPEECH_PROFILES,
+    LENGTH_HINTS, RP_LENGTH_HINTS,
+)
+from chatter_links import resolve_and_format_links
+from chatter_db import (
+    fail_event,
+    get_character_info_by_name,
+    mark_event,
+)
+from chatter_group_general_reaction import (
+    maybe_queue_group_general_reaction,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def init_general_config(config):
+    """Initialize module-level config values."""
+    global _chat_history_limit
+    try:
+        raw = config.get(
+            'LLMChatter.GeneralChat.HistoryLimit',
+            config.get(
+                'LLMChatter.ChatHistoryLimit', 10
+            )
+        )
+        val = int(raw)
+    except (ValueError, TypeError):
+        val = 10
+    _chat_history_limit = max(1, min(val, 50))
+
+    global _extended_conv_chance, _extended_max_messages
+    try:
+        _extended_conv_chance = int(config.get(
+            'LLMChatter.GeneralChat.'
+            'ExtendedConversationChance', 40
+        ))
+        _extended_conv_chance = max(
+            0, min(_extended_conv_chance, 100)
+        )
+    except (ValueError, TypeError):
+        _extended_conv_chance = 40
+    try:
+        _extended_max_messages = int(config.get(
+            'LLMChatter.GeneralChat.'
+            'ExtendedMaxMessages', 3
+        ))
+        _extended_max_messages = max(
+            3, min(_extended_max_messages, 8)
+        )
+    except (ValueError, TypeError):
+        _extended_max_messages = 3
+
+
+
+def _as_persona(persona, bot_name, mode):
+    """Accept a Persona or a plain trait list."""
+    if isinstance(persona, Persona):
+        return persona
+    return persona_from_fields(
+        bot_name, mode, traits=persona,
+    )
+
+
+def _pick_length_hint(mode):
+    """Pick a random length hint."""
+    is_rp = (mode == 'roleplay')
+    pool = RP_LENGTH_HINTS if is_rp else LENGTH_HINTS
+    hint = random.choice(pool)
+    long_chance = 15 if is_rp else 12
+    if random.randint(1, 100) <= long_chance:
+        return (
+            f"Length: {hint}\n"
+            f"Length mode: longer allowed "
+            f"(up to ~150 chars max) — one "
+            f"sentence\n"
+            f"HARD LIMIT: Never exceed 150 "
+            f"characters total"
+        )
+    return (
+        f"Length: {hint}\n"
+        f"Length mode: short/medium only "
+        f"(avoid long messages)\n"
+        f"HARD LIMIT: Never exceed 150 "
+        f"characters total"
+    )
+
+
+
+def _get_general_chat_history(
+    db, zone_id, limit=None, faction=""
+):
+    """Get recent General channel messages for a zone.
+    Returns oldest-first for natural prompt reading.
+    """
+    if limit is None:
+        limit = _chat_history_limit
+    cursor = db.cursor(dictionary=True)
+    if faction == 'Alliance':
+        race_filter = 'AND c.race IN (1, 3, 4, 7, 11)'
+    elif faction == 'Horde':
+        race_filter = 'AND c.race IN (2, 5, 6, 8, 10)'
+    else:
+        race_filter = ''
+    # Faction-scoped history fails closed: a speaker whose
+    # character row cannot establish a faction is not prompt context.
+    character_join = (
+        'JOIN characters c ON c.name = h.speaker_name'
+        if race_filter else ''
+    )
+    cursor.execute(f"""
+        SELECT h.speaker_name, h.is_bot, h.message
+        FROM llm_general_chat_history h
+        {character_join}
+        WHERE h.zone_id = %s
+          {race_filter}
+        ORDER BY h.id DESC
+        LIMIT %s
+    """, (zone_id, limit))
+    rows = cursor.fetchall()
+    return list(reversed(rows))
+
+
+def _format_general_history(history):
+    """Format General chat history for prompts."""
+    if not history:
+        return ""
+    lines = []
+    for msg in history:
+        name = msg['speaker_name']
+        text = msg['message']
+        if msg['is_bot']:
+            lines.append(f"  {name}: {text}")
+        else:
+            lines.append(
+                f"  {name} (player): {text}"
+            )
+    return (
+        "\nRecent General channel chat:\n"
+        + '\n'.join(lines)
+    )
+
+
+def _store_general_chat(
+    db, zone_id, speaker_name, is_bot, message
+):
+    """Store a message in General chat history
+    and prune old messages per zone.
+    """
+    cursor = db.cursor()
+    cursor.execute("""
+        INSERT INTO llm_general_chat_history
+        (zone_id, speaker_name, is_bot, message)
+        VALUES (%s, %s, %s, %s)
+    """, (
+        zone_id, speaker_name,
+        1 if is_bot else 0, message[:500]
+    ))
+    db.commit()
+
+    # Prune to keep recent messages per zone
+    cursor.execute("""
+        DELETE FROM llm_general_chat_history
+        WHERE zone_id = %s AND id NOT IN (
+            SELECT id FROM (
+                SELECT id
+                FROM llm_general_chat_history
+                WHERE zone_id = %s
+                ORDER BY id DESC
+                LIMIT %s
+            ) AS keep
+        )
+    """, (zone_id, zone_id, _chat_history_limit))
+    db.commit()
+
+
+def _get_bot_info(db, bot_guid):
+    """Fetch bot class/race/level from characters."""
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT name, class, race, level, gender
+        FROM characters
+        WHERE guid = %s
+    """, (bot_guid,))
+    return cursor.fetchone()
+
+
+def _filter_player_general_candidates(
+    db, player_faction, bot_guids, bot_names,
+):
+    """Keep speakers visible in the player's General channel."""
+    if not player_faction:
+        logger.warning(
+            "[GEN-FLOW] cannot resolve player faction"
+        )
+        return [], []
+
+    candidates = []
+    for bot_guid, bot_name in zip(bot_guids, bot_names):
+        try:
+            candidates.append((int(bot_guid), bot_name))
+        except (TypeError, ValueError):
+            continue
+    if not candidates:
+        return [], []
+
+    cursor = db.cursor(dictionary=True)
+    placeholders = ', '.join(['%s'] * len(candidates))
+    cursor.execute(f"""
+        SELECT guid, race
+        FROM characters
+        WHERE guid IN ({placeholders})
+    """, tuple(guid for guid, _name in candidates))
+    rows = cursor.fetchall()
+    cursor.close()
+    factions = {
+        int(row['guid']): get_race_faction(row.get('race'))
+        for row in rows
+    }
+
+    visible_guids = []
+    visible_names = []
+    for bot_guid, bot_name in candidates:
+        if factions.get(bot_guid) != player_faction:
+            continue
+        visible_guids.append(bot_guid)
+        visible_names.append(bot_name)
+
+    return visible_guids, visible_names
+
+
+def _resolve_zone_context(db, player_name, extra_data):
+    """Resolve player-centric zone for General chat.
+
+    Uses get_player_zone() as source of truth, falls
+    back to C++ event data. No subzone needed for
+    General channel (zone-wide scope).
+
+    Returns dict with zone_id, zone_name, zone_flavor,
+    zone_meta.
+    """
+    pz, _ = get_player_zone(db, player_name)
+    if pz:
+        zone_id = pz
+        zone_name = get_zone_name(pz) or 'Unknown'
+    else:
+        zone_id = int(
+            extra_data.get('zone_id', 0)
+        )
+        zone_name = extra_data.get(
+            'zone_name', 'Unknown'
+        )
+    zone_flavor = get_zone_flavor(zone_id) or ''
+    zone_meta = build_zone_metadata(
+        zone_name=(
+            zone_name
+            if zone_name != 'Unknown' else ''
+        ),
+        zone_flavor=zone_flavor,
+        subzone_name='',
+        subzone_lore='',
+    )
+    return {
+        'zone_id': zone_id,
+        'zone_name': zone_name,
+        'zone_flavor': zone_flavor,
+        'zone_meta': zone_meta,
+    }
+
+
+def _add_recent_general_speakers(
+    db, history, bot_guids, bot_names, zone_id, player_faction,
+):
+    """Add recent General speakers missing from the capped zone sample.
+
+    C++ sends at most MaxBotsPerZone candidates, so the bot the player
+    is talking to can be left out, and find_addressed_bot can only
+    resolve names it is given. Every bot speaker in this zone's history
+    (already bounded by ChatHistoryLimit) is checked, and added when it
+    is a playerbot (is_bot history rows; real players never are),
+    online, recorded in this zone, and of the player's faction.
+    Extends the lists in place.
+    """
+    if not player_faction or not zone_id:
+        return
+    known = set(bot_names)
+    wanted = []
+    for row in reversed(history or []):
+        name = row.get('speaker_name') or ''
+        if (row.get('is_bot') and name and name not in known
+                and name not in wanted):
+            wanted.append(name)
+    if not wanted:
+        return
+    placeholders = ', '.join(['%s'] * len(wanted))
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(f"""
+        SELECT guid, name, race
+        FROM characters
+        WHERE name IN ({placeholders})
+          AND online = 1
+          AND zone = %s
+    """, (*wanted, zone_id))
+    rows = cursor.fetchall()
+    cursor.close()
+    for row in rows:
+        if get_race_faction(row.get('race')) != player_faction:
+            continue
+        bot_guids.append(int(row['guid']))
+        bot_names.append(row['name'])
+
+
+def _select_primary_bot(
+    db, client, config, bot_guids, bot_names,
+    player_name, player_message, mode,
+    chat_hist="",
+):
+    """Pick the primary bot for a General reaction.
+
+    Handles addressed-bot detection, conversation
+    vs statement decision, and bot info lookup.
+
+    Returns dict with bot1_guid, bot1_idx, bot1_name,
+    bot1_race, bot1_class, bot1_class_id, bot1_level,
+    is_conversation. Profile preparation follows the silence decision.
+    Returns None if no valid bot found.
+    """
+    conv_chance = int(config.get(
+        'LLMChatter.GeneralChat.'
+        'ConversationChance', 30
+    ))
+    is_conversation = (
+        len(bot_guids) >= 2
+        and random.randint(1, 100) <= conv_chance
+    )
+
+    addr_result = find_addressed_bot(
+        player_message, bot_names,
+        client=client, config=config,
+        chat_history=chat_hist,
+    )
+    addressed = addr_result.get('bot')
+    multi_addressed = bool(
+        addr_result.get('multi_addressed')
+    )
+    brief_casual = bool(
+        addr_result.get('brief_casual')
+    )
+    reply_optional = bool(
+        addr_result.get('reply_optional')
+    )
+    if reply_optional or (brief_casual and not multi_addressed):
+        is_conversation = False
+
+    bot1_idx = None
+    if addressed:
+        for i, name in enumerate(bot_names):
+            if name == addressed:
+                bot1_idx = i
+                break
+    if bot1_idx is None:
+        bot1_idx = random.randint(
+            0, len(bot_guids) - 1
+        )
+
+    bot1_guid = int(bot_guids[bot1_idx])
+    bot1_info = _get_bot_info(db, bot1_guid)
+    if not bot1_info:
+        return None
+
+    return {
+        'bot1_guid': bot1_guid,
+        'bot1_idx': bot1_idx,
+        'bot1_name': bot1_info['name'],
+        'bot1_race': get_race_name(
+            bot1_info['race']
+        ),
+        'bot1_class': get_class_name(
+            bot1_info['class']
+        ),
+        'bot1_class_id': bot1_info['class'],
+        'bot1_level': bot1_info['level'],
+        'bot1_gender': get_gender_label(bot1_info['gender']),
+        'is_conversation': is_conversation,
+        'brief_casual': brief_casual,
+        'reply_optional': reply_optional,
+    }
+
+
+def _build_general_response_prompt(
+    bot_name, bot_race, bot_class, bot_level,
+    bot_gender,
+    persona, player_name, player_message,
+    zone_name, chat_history, mode,
+    recent_messages=None, allow_action=True,
+    link_context="",
+    speaker_talent_context=None,
+    target_talent_context=None,
+    zone_flavor="",
+    subzone_name="",
+    subzone_lore="",
+    brief_casual=False,
+    thread_context="",
+    brief_tier=None,
+    reply_length_hint=None,
+):
+    """Build prompt for a bot responding to a
+    player's General channel message.
+
+    thread_context: read-only zone-channel thread note
+    (chatter_threads.render_for_player_reply); skipped
+    for brief casual replies.
+    """
+    is_rp = (mode == 'roleplay')
+    persona = _as_persona(persona, bot_name, mode)
+    twist = maybe_get_creative_twist(mode=mode) if not brief_casual else None
+
+    rp_context = ""
+    if is_rp:
+        ctx = build_race_class_context(
+            bot_race, bot_class
+        )
+        if ctx:
+            rp_context = f"\n{ctx}"
+
+        profile = RACE_SPEECH_PROFILES.get(bot_race)
+        if profile:
+            fw = profile.get('flavor_words', [])
+            flavor = ', '.join(
+                random.sample(fw, min(3, len(fw)))
+            )
+            if flavor:
+                rp_context += (
+                    f"\nRace flavor words you might "
+                    f"use: {flavor}"
+                )
+
+    if is_rp:
+        style = (
+            "Reply in-character. Stay natural and "
+            "grounded. Don't break character."
+        )
+    else:
+        style = build_player_chat_guidance(
+            mode, 'general'
+        )
+
+    env_lines = (
+        build_environmental_context_lines()
+        if is_rp else []
+    )
+
+    identity = build_player_identity(
+        bot_name,
+        bot_race,
+        bot_class,
+        bot_level,
+        bot_gender,
+        mode,
+    )
+    prompt = (
+        f"{identity}\n"
+        f"{build_persona_block(persona, mode)}\n"
+    )
+    if speaker_talent_context:
+        prompt += f"{speaker_talent_context}\n"
+    if target_talent_context:
+        prompt += f"{target_talent_context}\n"
+    if twist:
+        prompt += f"{TWIST_LABEL}: {twist}\n"
+
+    address_hint = ""
+    if not brief_casual:
+        address_hint = (
+            f"- Address {player_name} by name "
+            f"somewhere in your reply (not always "
+            f"at the start)\n"
+        )
+
+    prompt += (
+        f"{'You are' if is_rp else 'Your character is'} in {zone_name}."
+    )
+    if env_lines:
+        prompt += "\n" + "\n".join(env_lines)
+    if is_rp and zone_flavor:
+        prompt += f"\nZone context: {zone_flavor}"
+    if is_rp and subzone_lore:
+        prompt += (
+            f"\nCurrent subzone: {subzone_lore}"
+        )
+    elif subzone_name:
+        prompt += f"\nSubzone: {subzone_name}"
+    prompt += (
+        f"{rp_context}\n"
+        f"{chat_history}\n\n"
+    )
+    if link_context:
+        prompt += f"{link_context}\n\n"
+    prompt += (
+        f"{player_name} just said in General "
+        f"channel:\n"
+        f"\"{player_message}\"\n\n"
+        + (
+            f"{thread_context}\n\n"
+            if thread_context and not brief_casual else ""
+        )
+        + f"{style}\n\n"
+        f"Reply in General channel.\n"
+        + (
+            f"{brief_casual_length_line(brief_tier)}\n"
+            if brief_casual
+            else f"{reply_length_hint or general_reply_length_line()}\n"
+        )
+        + build_conversational_scale_guidance(
+            force_brief=brief_casual, brief_tier=brief_tier,
+        )
+        + "\n"
+        f"Rules:\n"
+        f"- No quotes, no emojis\n"
+        f"- Prefer full words over internet slang — "
+        f"use abbreviations sparingly, not in every "
+        f"message (lol, omg, ngl are ok occasionally). "
+        f"Basic WoW terms always fine (dps, tank, "
+        f"healer, gg, buff, nerf)\n"
+        f"- NEVER use brackets [] around creature, "
+        f"NPC, zone, or faction names - write them "
+        f"as plain text\n"
+        f"- Respond to what {player_name} said\n"
+        f"{address_hint}"
+        "- Let your personality show in how you say it, "
+        f"without naming your traits\n"
+        f"- Don't repeat what they said\n"
+        f"- If there's chat history, stay "
+        f"consistent with the conversation\n"
+        "- Give a specific, natural response; avoid filler and stock remarks\n"
+    )
+    spice_line = format_spices_line(
+        maybe_pick_personality_spices(mode)
+    )
+    if spice_line:
+        prompt += f"\n{spice_line}"
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        prompt += f"\n{anti_rep}"
+    prompt = append_json_instruction(
+        prompt, allow_action, skip_emote=True,
+        skip_action_rng=True,
+    )
+    return prompt
+
+
+def _build_general_followup_prompt(
+    bot_name, bot_race, bot_class, bot_level,
+    bot_gender,
+    persona, first_bot_name, first_bot_response,
+    player_name, player_message,
+    zone_name, chat_history, mode,
+    recent_messages=None, allow_action=True,
+    link_context="",
+    speaker_talent_context=None,
+    target_talent_context=None,
+    zone_flavor="",
+    subzone_name="",
+    subzone_lore="",
+    brief_casual=False,
+    brief_tier=None,
+    reply_length_hint=None,
+):
+    """Build prompt for a 2nd bot following up
+    on the 1st bot's reaction in General channel.
+    """
+    is_rp = (mode == 'roleplay')
+    persona = _as_persona(persona, bot_name, mode)
+
+    rp_context = ""
+    if is_rp:
+        ctx = build_race_class_context(
+            bot_race, bot_class
+        )
+        if ctx:
+            rp_context = f"\n{ctx}"
+
+        profile = RACE_SPEECH_PROFILES.get(bot_race)
+        if profile:
+            fw = profile.get('flavor_words', [])
+            flavor = ', '.join(
+                random.sample(fw, min(3, len(fw)))
+            )
+            if flavor:
+                rp_context += (
+                    f"\nRace flavor words you might "
+                    f"use: {flavor}"
+                )
+
+    if is_rp:
+        style = (
+            "Reply in-character. Stay natural and "
+            "grounded."
+        )
+    else:
+        style = build_player_chat_guidance(
+            mode, 'general'
+        )
+
+    # 40% chance to address someone by name
+    address_hint = ""
+    if not brief_casual and random.random() < 0.4:
+        target = random.choice(
+            [player_name, first_bot_name]
+        )
+        address_hint = (
+            f"- You may address {target} by "
+            f"name in your reply\n"
+        )
+
+    identity = build_player_identity(
+        bot_name,
+        bot_race,
+        bot_class,
+        bot_level,
+        bot_gender,
+        mode,
+    )
+    prompt = (
+        f"{identity}\n"
+        f"{build_persona_block(persona, mode)}\n"
+    )
+    if speaker_talent_context:
+        prompt += f"{speaker_talent_context}\n"
+    if target_talent_context:
+        prompt += f"{target_talent_context}\n"
+    prompt += (
+        f"{'You are' if is_rp else 'Your character is'} in {zone_name}."
+    )
+    if is_rp and zone_flavor:
+        prompt += f"\nZone context: {zone_flavor}"
+    if is_rp and subzone_lore:
+        prompt += (
+            f"\nCurrent subzone: {subzone_lore}"
+        )
+    elif subzone_name:
+        prompt += f"\nSubzone: {subzone_name}"
+    prompt += (
+        f"{rp_context}\n"
+        f"{chat_history}\n\n"
+    )
+    if link_context:
+        prompt += f"{link_context}\n\n"
+    prompt += (
+        f"{player_name} said in General channel:\n"
+        f"\"{player_message}\"\n\n"
+        f"Then {first_bot_name} responded:\n"
+        f"\"{first_bot_response}\"\n\n"
+        f"{style}\n"
+        f"Add to the conversation - react to "
+        f"{first_bot_name}'s response or add your "
+        f"own take on what {player_name} said.\n"
+        + (
+            f"{brief_casual_length_line(brief_tier)}\n"
+            if brief_casual
+            else f"{reply_length_hint or general_reply_length_line()}\n"
+        )
+        + build_conversational_scale_guidance(
+            force_brief=brief_casual, brief_tier=brief_tier,
+        )
+        + "\n"
+        f"Rules:\n"
+        f"- No quotes, no emojis\n"
+        f"- Prefer full words over internet slang — "
+        f"use abbreviations sparingly, not in every "
+        f"message (lol, omg, ngl are ok occasionally). "
+        f"Basic WoW terms always fine (dps, tank, "
+        f"healer, gg, buff, nerf)\n"
+        f"- NEVER use brackets [] around creature, "
+        f"NPC, zone, or faction names - write them "
+        f"as plain text\n"
+        f"- Don't repeat what others said\n"
+        f"{address_hint}"
+        "- Add a specific reaction or perspective, without filler\n"
+        "- Let your personality show in how you say it, "
+        f"without naming your traits"
+    )
+    spice_line = format_spices_line(
+        maybe_pick_personality_spices(mode)
+    )
+    if spice_line:
+        prompt += f"\n{spice_line}"
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        prompt += f"\n{anti_rep}"
+    prompt = append_json_instruction(
+        prompt, allow_action, skip_emote=True,
+        skip_action_rng=True,
+    )
+    return prompt
+
+
+def process_general_player_msg_event(
+    event, db, client, config
+):
+    """Handle a player_general_msg event.
+
+    A real player said something in General channel.
+    Pick 1-2 bots from the zone to respond.
+    """
+    event_id = event['id']
+    extra_data = parse_extra_data(
+        event.get('extra_data'),
+        event_id,
+        'player_general_msg'
+    )
+
+    if not extra_data:
+        mark_event(db, event_id, 'skipped')
+        return False
+
+    player_name = extra_data.get(
+        'player_name', 'someone'
+    )
+    player_message = extra_data.get(
+        'player_message', ''
+    )
+    bot_guids = extra_data.get('bot_guids', [])
+    bot_names = extra_data.get('bot_names', [])
+    player_info = _get_bot_info(
+        db, int(event.get('subject_guid') or 0)
+    )
+    player_faction = get_race_faction(
+        player_info.get('race') if player_info else None
+    )
+    original_count = len(bot_guids)
+    bot_guids, bot_names = (
+        _filter_player_general_candidates(
+            db,
+            player_faction,
+            bot_guids,
+            bot_names,
+        )
+    )
+    if len(bot_guids) != original_count:
+        logger.info(
+            "[GEN-FLOW] player-react faction filter | "
+            "player=%s kept=%d/%d",
+            player_name,
+            len(bot_guids),
+            original_count,
+        )
+
+    # Resolve zone from player's location
+    zctx = _resolve_zone_context(
+        db, player_name, extra_data
+    )
+    zone_id = zctx['zone_id']
+    zone_name = zctx['zone_name']
+    zone_flavor = zctx['zone_flavor']
+    zone_meta = zctx['zone_meta']
+    subzone_name = ''
+    subzone_lore = ''
+
+    if not zone_id or not player_message:
+        mark_event(db, event_id, 'skipped')
+        return False
+
+    # Parse and resolve WoW links in message
+    link_context = ""
+    player_message, link_context = (
+        resolve_and_format_links(
+            config, player_message
+        )
+    )
+
+    if not bot_guids:
+        mark_event(db, event_id, 'skipped')
+        return False
+
+    # The zone channel's conversation thread: replies see what
+    # the channel was talking about, and the player's line
+    # joins it for the next ambient exchange.
+    thread_key = general_key(zone_id, player_faction)
+    thread_context = render_for_player_reply(thread_key, db)
+    note_player_message(thread_key, player_name, player_message)
+
+    try:
+        mode = get_chatter_mode(config)
+
+        # Fetch recent messages for anti-repetition
+        recent_msgs = get_recent_zone_messages(
+            db, zone_id, faction=player_faction
+        )
+
+        # Fetch chat history for this zone
+        history = _get_general_chat_history(
+            db, zone_id, faction=player_faction
+        )
+        chat_hist = _format_general_history(history)
+        _add_recent_general_speakers(
+            db, history, bot_guids, bot_names,
+            zone_id, player_faction,
+        )
+
+        # Pick primary bot and decide conv vs stmt
+        primary = _select_primary_bot(
+            db, client, config, bot_guids,
+            bot_names, player_name,
+            player_message, mode,
+            chat_hist=chat_hist,
+        )
+        if not primary:
+            mark_event(db, event_id, 'skipped')
+            return False
+
+        bot1_guid = primary['bot1_guid']
+        bot1_idx = primary['bot1_idx']
+        bot1_name = primary['bot1_name']
+        bot1_race = primary['bot1_race']
+        bot1_class = primary['bot1_class']
+        bot1_class_id = primary['bot1_class_id']
+        bot1_level = primary['bot1_level']
+        bot1_gender = primary['bot1_gender']
+        is_conversation = primary['is_conversation']
+        brief_casual = primary['brief_casual']
+        reply_optional = primary['reply_optional']
+        if not should_reply_to_optional_casual(
+            config,
+            {
+                'brief_casual': brief_casual,
+                'reply_optional': reply_optional,
+            },
+        ):
+            logger.info(
+                "[GEN-FLOW] player-react left unanswered "
+                "after optional-casual RNG | player=%s",
+                player_name,
+            )
+            mark_event(db, event_id, 'skipped')
+            return False
+
+        bot1_traits = prepare_channel_persona(
+            db, client, config, bot1_guid, bot1_name, 'general',
+        )
+
+        # Talent context injection
+        speaker_talent = None
+        target_talent = None
+        talent_chance = int(config.get(
+            'LLMChatter.TalentInjectionChance',
+            '40',
+        ))
+        if (
+            talent_chance > 0
+            and random.randint(1, 100)
+            <= talent_chance
+        ):
+            speaker_talent = build_talent_context(
+                db, bot1_guid,
+                bot1_class_id,
+                bot1_name,
+                perspective='speaker',
+            )
+        if (
+            talent_chance > 0
+            and random.randint(1, 100)
+            <= talent_chance
+        ):
+            pinfo = get_character_info_by_name(
+                db, player_name,
+            )
+            if pinfo:
+                target_talent = (
+                    build_talent_context(
+                        db, pinfo['guid'],
+                        pinfo['class'],
+                        player_name,
+                        perspective='target',
+                    )
+                )
+
+        # Build and send first bot prompt
+        allow_action = (
+            mode == 'roleplay'
+            and not brief_casual
+        )
+        brief_tier1 = (
+            pick_brief_casual_tier(config) if brief_casual else None
+        )
+        reply_tier1 = (
+            None if brief_casual else pick_general_reply_tier(config)
+        )
+        if reply_tier1:
+            zone_meta['general_reply_length_tier'] = reply_tier1
+        if brief_tier1:
+            zone_meta['brief_casual_tier'] = brief_tier1
+        prompt1 = _build_general_response_prompt(
+            bot1_name, bot1_race, bot1_class,
+            bot1_level, bot1_gender, bot1_traits,
+            player_name, player_message,
+            zone_name, chat_hist, mode,
+            recent_messages=recent_msgs,
+            allow_action=allow_action,
+            link_context=link_context,
+            speaker_talent_context=speaker_talent,
+            target_talent_context=target_talent,
+            zone_flavor=zone_flavor,
+            subzone_name=subzone_name,
+            subzone_lore=subzone_lore,
+            brief_casual=brief_casual,
+            thread_context=thread_context,
+            brief_tier=brief_tier1,
+            reply_length_hint=general_reply_length_line(config, reply_tier1),
+        )
+
+        max_tokens = int(config.get(
+            'LLMChatter.MaxTokens', 200
+        ))
+        if speaker_talent:
+            zone_meta['speaker_talent'] = (
+                speaker_talent
+            )
+        if target_talent:
+            zone_meta['target_talent'] = (
+                target_talent
+            )
+        response1 = call_llm(
+            client, prompt1, config,
+            max_tokens_override=max_tokens,
+            context=(
+                f"gen-msg:#{event_id}"
+                f":{bot1_name}"
+            ),
+            label='general_player_msg',
+            metadata=zone_meta,
+        )
+
+        if not response1:
+            mark_event(db, event_id, 'skipped')
+            return False
+
+        parsed1 = parse_single_response(response1)
+        if (parsed1.get('action')
+                and not should_include_action()):
+            parsed1['action'] = None
+        msg1 = strip_speaker_prefix(
+            parsed1['message'], bot1_name
+        )
+        msg1 = cleanup_message(
+            msg1, action=parsed1.get('action')
+        )
+        if (
+            brief_casual
+            and not brief_casual_response_fits(
+                msg1, tier=brief_tier1
+            )
+        ):
+            repair_meta = dict(zone_meta)
+            repair_meta['brief_casual_repair'] = True
+            response1 = call_llm(
+                client,
+                build_brief_casual_repair_prompt(
+                    prompt1, tier=brief_tier1
+                ),
+                config,
+                max_tokens_override=max_tokens,
+                context=f"gen-msg-brief-repair:{bot1_name}",
+                label='general_player_msg',
+                metadata=repair_meta,
+            )
+            parsed1 = parse_single_response(response1 or '')
+            msg1 = strip_speaker_prefix(
+                parsed1.get('message', ''), bot1_name
+            )
+            msg1 = cleanup_message(msg1)
+        if not msg1:
+            mark_event(db, event_id, 'skipped')
+            return False
+        if (
+            brief_casual
+            and not brief_casual_response_fits(
+                msg1, tier=brief_tier1
+            )
+        ):
+            mark_event(db, event_id, 'skipped')
+            return False
+        msg1 = shorten_chat_message(msg1)
+
+
+        # Queue first bot's message — responsive
+        # since player is waiting for a reply.
+        # Skip zone gap: the player asked a direct
+        # question and is actively waiting. Cap at
+        # 5s so the reply feels conversational.
+        delay1 = min(
+            calculate_dynamic_delay(
+                len(msg1), config, responsive=True,
+            ),
+            5.0,
+        )
+        conv_label = "conv" if is_conversation else "stmt"
+        logger.info(
+            "[GEN-FLOW] player-react %s | "
+            "bot=%s delay=%.1fs seq=0",
+            conv_label, bot1_name, delay1,
+        )
+        # General channel: skip emotes
+        # (proximity-based, not visible
+        #  to zone-wide recipients)
+        insert_chat_message(
+            db, bot1_guid, bot1_name, msg1,
+            channel='general',
+            delay_seconds=delay1,
+            event_id=event_id,
+            sequence=0,
+        )
+        maybe_queue_group_general_reaction(
+            db, config,
+            bot1_guid, bot1_name, msg1,
+            zone_id, int(event.get('map_id') or 0),
+            source_event_id=event_id,
+            source_sequence=0,
+            source_delay_seconds=delay1,
+        )
+
+        # Store in General chat history
+        _store_general_chat(
+            db, zone_id, bot1_name, True, msg1
+        )
+
+        # Conversation mode: second bot follows up
+        if is_conversation:
+            try:
+                followup = _general_followup(
+                    db, client, config,
+                    event_id, zone_id, zone_name,
+                    bot_guids, bot1_idx, bot1_guid,
+                    bot1_name, msg1,
+                    player_name, player_message,
+                    mode, delay1,
+                    recent_msgs=recent_msgs,
+                    allow_action=allow_action,
+                    link_context=link_context,
+                    speaker_talent_context=(
+                        speaker_talent
+                    ),
+                    target_talent_context=(
+                        target_talent
+                    ),
+                    zone_flavor=zone_flavor,
+                    subzone_name=subzone_name,
+                    subzone_lore=subzone_lore,
+                    brief_casual=brief_casual,
+                    brief_tier_avoid=brief_tier1,
+                    reply_tier_avoid=reply_tier1,
+                    zone_meta=zone_meta,
+                    faction=player_faction,
+                )
+                # Extended conversation chance
+                if (
+                    followup
+                    and not brief_casual
+                    and _extended_conv_chance > 0
+                    and random.randint(1, 100)
+                    <= _extended_conv_chance
+                ):
+                    try:
+                        _general_extended_conversation(
+                            db, client, config,
+                            event_id, zone_id,
+                            zone_name,
+                            bot_guids,
+                            bot1_guid, bot1_name,
+                            bot1_traits,
+                            msg1,
+                            followup['bot2_guid'],
+                            followup['bot2_name'],
+                            followup['bot2_traits'],
+                            followup['bot2_response'],
+                            player_name,
+                            player_message,
+                            mode,
+                            followup['delay2'],
+                            previous_reply_tier=followup.get('reply_tier'),
+                            recent_msgs=recent_msgs,
+                            allow_action=allow_action,
+                            link_context=link_context,
+                            speaker_talent_context=(
+                                speaker_talent
+                            ),
+                            target_talent_context=(
+                                target_talent
+                            ),
+                            zone_flavor=zone_flavor,
+                            subzone_name=subzone_name,
+                            subzone_lore=subzone_lore,
+                            zone_meta=zone_meta,
+                            faction=player_faction,
+                        )
+                    except Exception as e3:
+                        logger.error(
+                            "[GEN] extended conv "
+                            "failed event=%s: %s",
+                            event_id, e3,
+                            exc_info=True
+                        )
+            except Exception as e2:
+                logger.error(
+                    "[GEN] followup failed "
+                    "event=%s: %s",
+                    event_id, e2,
+                    exc_info=True
+                )
+
+        mark_event(db, event_id, 'completed')
+        return True
+
+    except Exception:
+        fail_event(
+            db, event_id,
+            'player_general_msg', 'handler error',
+        )
+        return False
+
+
+def _general_followup(
+    db, client, config,
+    event_id, zone_id, zone_name,
+    bot_guids, bot1_idx, bot1_guid,
+    bot1_name, bot1_response,
+    player_name, player_message,
+    mode, delay1,
+    recent_msgs=None,
+    allow_action=True,
+    link_context="",
+    speaker_talent_context=None,
+    target_talent_context=None,
+    zone_flavor="",
+    subzone_name="",
+    subzone_lore="",
+    zone_meta=None,
+    brief_casual=False,
+    faction="",
+    brief_tier_avoid=None,
+    reply_tier_avoid=None,
+):
+    """Generate a second bot's followup response
+    in General channel conversation mode.
+    """
+    # Pick a different bot
+    other_guids = [
+        int(g) for i, g in enumerate(bot_guids)
+        if i != bot1_idx
+    ]
+    if not other_guids:
+        return
+
+    bot2_guid = random.choice(other_guids)
+    bot2_info = _get_bot_info(db, bot2_guid)
+    if not bot2_info:
+        return
+
+    bot2_name = bot2_info['name']
+    bot2_race = get_race_name(bot2_info['race'])
+    bot2_class = get_class_name(bot2_info['class'])
+    bot2_level = bot2_info['level']
+    bot2_gender = get_gender_label(bot2_info['gender'])
+    bot2_traits = prepare_channel_persona(
+        db, client, config, bot2_guid, bot2_name, 'general',
+    )
+
+    # Recompute speaker talent for bot2
+    bot2_speaker_talent = None
+    talent_chance = int(config.get(
+        'LLMChatter.TalentInjectionChance',
+        '40',
+    ))
+    if (
+        talent_chance > 0
+        and random.randint(1, 100)
+        <= talent_chance
+    ):
+        bot2_speaker_talent = build_talent_context(
+            db, bot2_guid,
+            bot2_info['class'],
+            bot2_name,
+            perspective='speaker',
+        )
+
+    # Get updated history (includes first response)
+    history = _get_general_chat_history(
+        db, zone_id, faction=faction
+    )
+    chat_hist = _format_general_history(history)
+
+    brief_tier2 = (
+        pick_brief_casual_tier(config, avoid=brief_tier_avoid)
+        if brief_casual else None
+    )
+    reply_tier2 = (
+        None if brief_casual
+        else pick_general_reply_tier(config, avoid=reply_tier_avoid)
+    )
+    prompt2 = _build_general_followup_prompt(
+        bot2_name, bot2_race, bot2_class,
+        bot2_level, bot2_gender, bot2_traits,
+        bot1_name, bot1_response,
+        player_name, player_message,
+        zone_name, chat_hist, mode,
+        recent_messages=recent_msgs,
+        allow_action=allow_action,
+        link_context=link_context,
+        speaker_talent_context=(
+            bot2_speaker_talent
+        ),
+        target_talent_context=(
+            target_talent_context
+        ),
+        zone_flavor=zone_flavor,
+        subzone_name=subzone_name,
+        subzone_lore=subzone_lore,
+        brief_casual=brief_casual,
+        brief_tier=brief_tier2,
+        reply_length_hint=general_reply_length_line(config, reply_tier2),
+    )
+
+    max_tokens = int(config.get(
+        'LLMChatter.MaxTokens', 200
+    ))
+    if zone_meta is None:
+        zone_meta = {}
+    if reply_tier2:
+        zone_meta['general_reply_length_tier'] = reply_tier2
+    if brief_tier2:
+        zone_meta['brief_casual_tier'] = brief_tier2
+    if bot2_speaker_talent:
+        zone_meta['speaker_talent'] = (
+            bot2_speaker_talent
+        )
+    if target_talent_context:
+        zone_meta['target_talent'] = (
+            target_talent_context
+        )
+    response2 = call_llm(
+        client, prompt2, config,
+        max_tokens_override=max_tokens,
+        context=f"gen-followup:{bot2_name}",
+        label='general_followup',
+        metadata=zone_meta,
+    )
+    if not response2:
+        return
+
+    parsed2 = parse_single_response(response2)
+    if (parsed2.get('action')
+            and not should_include_action()):
+        parsed2['action'] = None
+    msg2 = strip_speaker_prefix(
+        parsed2['message'], bot2_name
+    )
+    msg2 = cleanup_message(
+        msg2, action=parsed2.get('action')
+    )
+    if (
+        brief_casual
+        and not brief_casual_response_fits(
+            msg2, tier=brief_tier2
+        )
+    ):
+        repair_meta = dict(zone_meta)
+        repair_meta['brief_casual_repair'] = True
+        response2 = call_llm(
+            client,
+            build_brief_casual_repair_prompt(
+                prompt2, tier=brief_tier2
+            ),
+            config,
+            max_tokens_override=max_tokens,
+            context=f"gen-followup-brief-repair:{bot2_name}",
+            label='general_followup',
+            metadata=repair_meta,
+        )
+        parsed2 = parse_single_response(response2 or '')
+        msg2 = strip_speaker_prefix(
+            parsed2.get('message', ''), bot2_name
+        )
+        msg2 = cleanup_message(msg2)
+    if not msg2:
+        return
+    if (
+        brief_casual
+        and not brief_casual_response_fits(
+            msg2, tier=brief_tier2
+        )
+    ):
+        return
+    msg2 = shorten_chat_message(msg2)
+
+
+    # Stagger: first bot delay + responsive gap
+    delay2 = delay1 + random.randint(2, 5)
+
+    logger.info(
+        "[GEN-FLOW] player-react followup | "
+        "bot=%s delay=%.1fs seq=1 (gap=%.1fs)",
+        bot2_name, delay2, delay2 - delay1,
+    )
+    # General channel: skip emotes
+    insert_chat_message(
+        db, bot2_guid, bot2_name, msg2,
+        channel='general',
+        delay_seconds=delay2,
+        event_id=event_id,
+        sequence=1,
+    )
+    maybe_queue_group_general_reaction(
+        db, config,
+        bot2_guid, bot2_name, msg2,
+        zone_id, 0,
+        source_event_id=event_id,
+        source_sequence=1,
+        source_delay_seconds=delay2,
+    )
+
+    # Keep later automated chatter behind this
+    # player-driven exchange without shortening an
+    # existing reservation from another producer.
+    _extend_zone_delivery_window(zone_id, delay2)
+
+    # Store in General chat history
+    _store_general_chat(
+        db, zone_id, bot2_name, True, msg2
+    )
+
+    return {
+        'bot2_guid': bot2_guid,
+        'bot2_name': bot2_name,
+        'bot2_traits': bot2_traits,
+        'bot2_response': msg2,
+        'delay2': delay2,
+        'reply_tier': reply_tier2,
+    }
+
+
+def _build_general_continuation_prompt(
+    bot_name, bot_race, bot_class, bot_level,
+    bot_gender,
+    persona, conversation_thread,
+    zone_name, chat_history, mode,
+    recent_messages=None, allow_action=True,
+    remaining_messages=3, link_context="",
+    speaker_talent_context=None,
+    target_talent_context=None,
+    zone_flavor="",
+    subzone_name="",
+    subzone_lore="",
+    reply_length_hint=None,
+):
+    """Build prompt for a continuation message in
+    an extended General channel conversation.
+
+    conversation_thread is a list of dicts:
+      [{'name': str, 'message': str, 'is_bot': bool}]
+    """
+    is_rp = (mode == 'roleplay')
+    persona = _as_persona(persona, bot_name, mode)
+
+    rp_context = ""
+    if is_rp:
+        ctx = build_race_class_context(
+            bot_race, bot_class
+        )
+        if ctx:
+            rp_context = f"\n{ctx}"
+
+        profile = RACE_SPEECH_PROFILES.get(bot_race)
+        if profile:
+            fw = profile.get('flavor_words', [])
+            flavor = ', '.join(
+                random.sample(fw, min(3, len(fw)))
+            )
+            if flavor:
+                rp_context += (
+                    f"\nRace flavor words you might "
+                    f"use: {flavor}"
+                )
+
+    if is_rp:
+        style = (
+            "Reply in-character. Stay natural and "
+            "grounded."
+        )
+    else:
+        style = build_player_chat_guidance(
+            mode, 'general'
+        )
+
+    # Format the conversation thread
+    thread_lines = []
+    for entry in conversation_thread:
+        tag = "" if entry['is_bot'] else " (player)"
+        thread_lines.append(
+            f"  {entry['name']}{tag}: "
+            f"{entry['message']}"
+        )
+    thread_text = "\n".join(thread_lines)
+
+    # Pick someone to maybe address by name
+    other_names = list(set(
+        e['name'] for e in conversation_thread
+        if e['name'] != bot_name
+    ))
+    address_hint = ""
+    if other_names and random.random() < 0.4:
+        target = random.choice(other_names)
+        address_hint = (
+            f"- You may address {target} by "
+            f"name in your reply\n"
+        )
+
+    identity = build_player_identity(
+        bot_name,
+        bot_race,
+        bot_class,
+        bot_level,
+        bot_gender,
+        mode,
+    )
+    prompt = (
+        f"{identity}\n"
+        f"{build_persona_block(persona, mode)}\n"
+    )
+    if speaker_talent_context:
+        prompt += f"{speaker_talent_context}\n"
+    if target_talent_context:
+        prompt += f"{target_talent_context}\n"
+    prompt += (
+        f"{'You are' if is_rp else 'Your character is'} in {zone_name}."
+    )
+    if is_rp and zone_flavor:
+        prompt += f"\nZone context: {zone_flavor}"
+    if is_rp and subzone_lore:
+        prompt += (
+            f"\nCurrent subzone: {subzone_lore}"
+        )
+    elif subzone_name:
+        prompt += f"\nSubzone: {subzone_name}"
+    prompt += (
+        f"{rp_context}\n"
+        f"{chat_history}\n\n"
+    )
+    if link_context:
+        prompt += f"{link_context}\n\n"
+    prompt += (
+        f"A conversation is happening in "
+        f"General channel:\n"
+        f"{thread_text}\n\n"
+        f"{style}\n"
+        f"Continue the conversation naturally. "
+        f"React to what was just said or add "
+        f"your own perspective.\n"
+        f"{reply_length_hint or general_reply_length_line()}\n"
+        f"{build_conversational_scale_guidance()}\n"
+        f"Rules:\n"
+        f"- No quotes, no emojis\n"
+        f"- Prefer full words over internet slang — "
+        f"use abbreviations sparingly, not in every "
+        f"message (lol, omg, ngl are ok occasionally). "
+        f"Basic WoW terms always fine (dps, tank, "
+        f"healer, gg, buff, nerf)\n"
+        f"- NEVER use brackets [] around creature, "
+        f"NPC, zone, or faction names - write them "
+        f"as plain text\n"
+        f"- Don't repeat what others said\n"
+        f"{address_hint}"
+        "- Add a specific reaction or perspective, without filler\n"
+        "- Let your personality show in how you say it, "
+        f"without naming your traits"
+    )
+    if remaining_messages <= 2:
+        prompt += (
+            f"\n- The conversation should feel "
+            f"like it's winding down naturally"
+        )
+    spice_line = format_spices_line(
+        maybe_pick_personality_spices(mode)
+    )
+    if spice_line:
+        prompt += f"\n{spice_line}"
+    anti_rep = build_anti_repetition_context(
+        recent_messages
+    )
+    if anti_rep:
+        prompt += f"\n{anti_rep}"
+    prompt = append_json_instruction(
+        prompt, allow_action, skip_emote=True,
+        skip_action_rng=True,
+    )
+    return prompt
+
+
+def _general_extended_conversation(
+    db, client, config,
+    event_id, zone_id, zone_name,
+    bot_guids,
+    bot1_guid, bot1_name, bot1_traits,
+    bot1_response,
+    bot2_guid, bot2_name, bot2_traits,
+    bot2_response,
+    player_name, player_message,
+    mode, last_delay,
+    recent_msgs=None,
+    allow_action=True,
+    link_context="",
+    speaker_talent_context=None,
+    target_talent_context=None,
+    zone_flavor="",
+    subzone_name="",
+    subzone_lore="",
+    zone_meta=None,
+    faction="",
+    previous_reply_tier=None,
+):
+    """Generate additional messages beyond the
+    initial 2-message conversation in General
+    channel. Bots alternate with diminishing
+    continuation chance.
+    """
+    # Diminishing chances per additional message
+    continuation_chances = [70, 50, 30]
+
+    # Build conversation thread so far
+    thread = [
+        {
+            'name': player_name,
+            'message': player_message,
+            'is_bot': False,
+        },
+        {
+            'name': bot1_name,
+            'message': bot1_response,
+            'is_bot': True,
+        },
+        {
+            'name': bot2_name,
+            'message': bot2_response,
+            'is_bot': True,
+        },
+    ]
+
+    # Participating bots: bot1 and bot2 always,
+    # optionally a 3rd joins
+    participants = [
+        {
+            'guid': bot1_guid,
+            'name': bot1_name,
+            'traits': bot1_traits,
+        },
+        {
+            'guid': bot2_guid,
+            'name': bot2_name,
+            'traits': bot2_traits,
+        },
+    ]
+
+    # Maybe add a 3rd bot (50% chance if available)
+    other_guids = [
+        int(g) for i, g in enumerate(bot_guids)
+        if int(g) not in (bot1_guid, bot2_guid)
+    ]
+    if other_guids and random.random() < 0.5:
+        bot3_guid = random.choice(other_guids)
+        bot3_info = _get_bot_info(db, bot3_guid)
+        if bot3_info:
+            participants.append({
+                'guid': bot3_guid,
+                'name': bot3_info['name'],
+                'traits': None,
+            })
+
+    # Track who spoke last to avoid repeats
+    last_speaker_guid = bot2_guid
+    # Messages sent so far (bot1 + bot2 = 2)
+    msg_count = 2
+    current_delay = last_delay
+    max_msgs = _extended_max_messages
+
+    max_tokens = int(config.get(
+        'LLMChatter.MaxTokens', 200
+    ))
+
+    # cont_turn tracks how many continuation
+    # RNG rolls we've made (0-indexed).
+    # First continuation (turn 0) is guaranteed.
+    cont_turn = 0
+
+    while msg_count < max_msgs:
+        # First extra message is guaranteed;
+        # subsequent ones use diminishing chance
+        if cont_turn > 0:
+            chance_idx = min(
+                cont_turn - 1,
+                len(continuation_chances) - 1,
+            )
+            roll = random.randint(1, 100)
+            if roll > continuation_chances[chance_idx]:
+                break
+
+        # Pick next speaker (not the last one)
+        eligible = [
+            p for p in participants
+            if p['guid'] != last_speaker_guid
+        ]
+        if not eligible:
+            break
+        speaker = random.choice(eligible)
+
+        # Fetch bot info for prompt
+        sp_info = _get_bot_info(
+            db, speaker['guid']
+        )
+        if not sp_info:
+            participants = [
+                p for p in participants
+                if p['guid'] != speaker['guid']
+            ]
+            # Don't consume a turn — retry
+            continue
+
+        if speaker['traits'] is None:
+            speaker['traits'] = prepare_channel_persona(
+                db, client, config, speaker['guid'], speaker['name'],
+                'general',
+            )
+
+        sp_race = get_race_name(sp_info['race'])
+        sp_class = get_class_name(sp_info['class'])
+        sp_level = sp_info['level']
+        sp_gender = get_gender_label(sp_info['gender'])
+
+        # Recompute speaker talent for this bot
+        sp_speaker_talent = None
+        talent_chance = int(config.get(
+            'LLMChatter.TalentInjectionChance',
+            '40',
+        ))
+        if (
+            talent_chance > 0
+            and random.randint(1, 100)
+            <= talent_chance
+        ):
+            sp_speaker_talent = (
+                build_talent_context(
+                    db, speaker['guid'],
+                    sp_info['class'],
+                    speaker['name'],
+                    perspective='speaker',
+                )
+            )
+
+        # Get updated history
+        history = _get_general_chat_history(
+            db, zone_id, faction=faction
+        )
+        chat_hist = _format_general_history(history)
+
+        # remaining after this message is sent
+        remaining = max_msgs - (msg_count + 1)
+        reply_tier = pick_general_reply_tier(config, avoid=previous_reply_tier)
+        prompt = _build_general_continuation_prompt(
+            speaker['name'], sp_race, sp_class,
+            sp_level, sp_gender, speaker['traits'],
+            thread, zone_name, chat_hist, mode,
+            reply_length_hint=general_reply_length_line(config, reply_tier),
+            recent_messages=recent_msgs,
+            allow_action=allow_action,
+            remaining_messages=remaining,
+            link_context=link_context,
+            speaker_talent_context=(
+                sp_speaker_talent
+            ),
+            target_talent_context=(
+                target_talent_context
+            ),
+            zone_flavor=zone_flavor,
+            subzone_name=subzone_name,
+            subzone_lore=subzone_lore,
+        )
+
+        if zone_meta is None:
+            zone_meta = {}
+        zone_meta['general_reply_length_tier'] = reply_tier
+        if sp_speaker_talent:
+            zone_meta['speaker_talent'] = (
+                sp_speaker_talent
+            )
+        else:
+            zone_meta.pop(
+                'speaker_talent', None
+            )
+        if target_talent_context:
+            zone_meta['target_talent'] = (
+                target_talent_context
+            )
+        response = call_llm(
+            client, prompt, config,
+            max_tokens_override=max_tokens,
+            context=(
+                f"gen-extended:{speaker['name']}"
+            ),
+            label='general_conv',
+            metadata=zone_meta,
+        )
+        if not response:
+            break
+
+        parsed = parse_single_response(response)
+        if (parsed.get('action')
+                and not should_include_action()):
+            parsed['action'] = None
+        msg = strip_speaker_prefix(
+            parsed['message'], speaker['name']
+        )
+        msg = cleanup_message(
+            msg, action=parsed.get('action')
+        )
+        if not msg:
+            break
+        msg = shorten_chat_message(msg)
+
+        msg_count += 1
+        prev_delay = current_delay
+        current_delay += random.randint(2, 5)
+
+        logger.info(
+            "[GEN-FLOW] extended conv | "
+            "bot=%s delay=%.1fs seq=%d "
+            "(gap=%.1fs)",
+            speaker['name'], current_delay,
+            msg_count - 1,
+            current_delay - prev_delay,
+        )
+        insert_chat_message(
+            db, speaker['guid'],
+            speaker['name'], msg,
+            channel='general',
+            delay_seconds=current_delay,
+            event_id=event_id,
+            sequence=msg_count - 1,
+        )
+        _extend_zone_delivery_window(
+            zone_id, current_delay
+        )
+        maybe_queue_group_general_reaction(
+            db, config,
+            speaker['guid'], speaker['name'], msg,
+            zone_id, 0,
+            source_event_id=event_id,
+            source_sequence=msg_count - 1,
+            source_delay_seconds=current_delay,
+        )
+
+        _store_general_chat(
+            db, zone_id,
+            speaker['name'], True, msg
+        )
+
+        # Update thread and last speaker
+        thread.append({
+            'name': speaker['name'],
+            'message': msg,
+            'is_bot': True,
+        })
+        last_speaker_guid = speaker['guid']
+        previous_reply_tier = reply_tier
+        cont_turn += 1
+

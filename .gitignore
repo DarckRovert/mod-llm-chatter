@@ -1,0 +1,9 @@
+__pycache__/
+dev-only
+.claude/
+*.conf
+!*.conf.dist
+*.env
+.DS_Store
+Gemini.md
+logs/
