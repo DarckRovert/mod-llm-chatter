@@ -613,11 +613,48 @@ def discover_local_endpoint(preferred_url: str = None) -> str:
         return _DISCOVERED_BASE_URL
 
 
+def get_model_size_billions(model_id: str) -> float:
+    """Extrae el tamaño en billones de parámetros (B) de un model ID para ordenar de menor a mayor."""
+    if not isinstance(model_id, str):
+        model_id = str(model_id or '')
+    m_b = re.search(r'(\d+(?:\.\d+)?)\s*[bB]\b', model_id)
+    if m_b:
+        try:
+            return float(m_b.group(1))
+        except ValueError:
+            pass
+    m_m = re.search(r'(\d+(?:\.\d+)?)\s*[mM]\b', model_id)
+    if m_m:
+        try:
+            return float(m_m.group(1)) / 1000.0
+        except ValueError:
+            pass
+    lower = model_id.lower()
+    if 'lfm2' in lower or 'nano' in lower or 'tiny' in lower:
+        return 1.2
+    if 'small' in lower or 'mini' in lower:
+        return 3.0
+    return 999.0
+
+
+def select_smallest_model(model_candidates: list) -> str:
+    """Regla de Gobernanza L9: Siempre seleccionar de los modelos detectados el de menor tamaño (menor huella VRAM/RAM)."""
+    if not model_candidates:
+        return "liquid/lfm2-1.2b"
+    valid = [m for m in model_candidates if m and not any(k in str(m).lower() for k in ('embed', 'bge-', 'rerank', 'reward', 'clip', 'tokenizer', 'whisper'))]
+    if not valid:
+        valid = [m for m in model_candidates if m]
+    if not valid:
+        return "liquid/lfm2-1.2b"
+    sorted_models = sorted(valid, key=lambda m: (get_model_size_billions(m), len(str(m))))
+    return str(sorted_models[0])
+
+
 def discover_active_model(base_url: str = None) -> Optional[str]:
     """Query /v1/models to detect active generative models loaded in memory.
 
     Filters out embedding, reranker, and vision-only auxiliary models.
-    Returns the identifier of the primary generative model.
+    Returns the identifier of the smallest active generative model.
     """
     global _DISCOVERED_MODEL
     import urllib.request
@@ -640,8 +677,8 @@ def discover_active_model(base_url: str = None) -> Optional[str]:
                     continue
                 candidates.append(m_id)
             if candidates:
-                _DISCOVERED_MODEL = candidates[0]
-                logger.info("Modelo LLM local descubierto y activo: '%s' (de %d disponibles)", _DISCOVERED_MODEL, len(candidates))
+                _DISCOVERED_MODEL = select_smallest_model(candidates)
+                logger.info("Modelo LLM local descubierto y activo (menor huella): '%s' (de %d disponibles)", _DISCOVERED_MODEL, len(candidates))
                 return _DISCOVERED_MODEL
     except Exception as exc:
         logger.debug("No se pudo autodescubrir modelos en %s: %s", url, exc)
