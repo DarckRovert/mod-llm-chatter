@@ -560,6 +560,156 @@ def _location_lines(
     return lines
 
 
+def build_proximity_bot_situational_lines(
+    speaker: Dict,
+    extra: Dict,
+    mode: str = 'roleplay',
+) -> List[str]:
+    """Extract physical and situational awareness for playerbots.
+
+    Implements Embodied Cognition and Dual-Attention:
+    - In-combat: breathless, urgent, telegraphic (2-6 words).
+    - Critical health / low mana: acute pain / exhaustion.
+    - Physical motor activities (fishing, mining, crafting, mounted, sitting, eating):
+      directs the LLM to ground dialogue in ongoing physical action.
+    """
+    if not speaker or speaker.get('is_npc'):
+        return []
+
+    lines = []
+    bot_state = speaker.get('bot_state')
+    if not isinstance(bot_state, dict):
+        extra_state = extra.get('bot_state') if isinstance(extra, dict) else None
+        bot_state = extra_state if isinstance(extra_state, dict) else {}
+
+    activity = str(
+        speaker.get('current_activity')
+        or (extra.get('current_activity') if isinstance(extra, dict) else '')
+        or ''
+    ).strip().lower()
+
+    # 1. Combat Urgency
+    in_combat = bool(bot_state.get('in_combat')) or (activity == 'combat')
+    target = str(bot_state.get('target') or '').strip()
+
+    if in_combat:
+        target_clause = f" fighting {target}" if target else " engaged in active combat"
+        lines.append(
+            f"SITUATIONAL AWARENESS: You are currently{target_clause}! "
+            "Your reply MUST be urgent, breathless, or telegraphic (2-6 words), shouting a warning or asking for help. "
+            "Do NOT engage in calm, casual, or leisurely conversation."
+        )
+
+    # 2. Physical Condition (Health & Mana)
+    hp = bot_state.get('health_pct')
+    if hp is not None:
+        try:
+            hp_int = int(hp)
+            if hp_int <= 25:
+                lines.append(
+                    f"PHYSICAL CONDITION: You are critically wounded ({hp_int}% health), suffering acute physical pain and distress."
+                )
+            elif hp_int <= 50:
+                lines.append(
+                    f"PHYSICAL CONDITION: You are wounded ({hp_int}% health), visibly injured and bleeding."
+                )
+        except (ValueError, TypeError):
+            pass
+
+    mp = bot_state.get('mana_pct')
+    if mp is not None:
+        try:
+            mp_int = int(mp)
+            if 0 <= mp_int <= 20:
+                lines.append(
+                    f"MANA EXHAUSTION: You are completely drained of magical energy ({mp_int}% mana), feeling winded and fatigued."
+                )
+        except (ValueError, TypeError):
+            pass
+
+    # 3. Peaceful Motor Activities (Dual-Attention Pattern)
+    if not in_combat:
+        if activity == 'fishing':
+            lines.append(
+                "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are currently fishing with a rod, watching the water and bobber. "
+                "Respond to the player while naturally weaving in your focus on the fishing line or waiting for a bite."
+            )
+        elif activity == 'gathering':
+            lines.append(
+                "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are gathering resources (mining/herbalism/skinning) with your hands and tools. "
+                "Respond to the player while naturally acknowledging the node or work you are doing."
+            )
+        elif activity == 'crafting':
+            lines.append(
+                "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are actively crafting/working on trade skills. "
+                "Respond to the player while naturally keeping one eye on your crafting tools or materials."
+            )
+        elif activity == 'eating_drinking':
+            lines.append(
+                "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are sitting down eating food or drinking to regain strength. "
+                "Respond to the player casually between bites or sips of drink."
+            )
+        elif activity == 'sitting_resting':
+            lines.append(
+                "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are sitting down resting your legs and recovering. "
+                "Respond comfortably from a seated, relaxed posture."
+            )
+        elif activity == 'mounted':
+            lines.append(
+                "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are mounted on your steed/mount. "
+                "Respond while seated atop your mount, holding the reins."
+            )
+        elif activity == 'swimming':
+            lines.append(
+                "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are currently swimming/treading water. "
+                "Respond while keeping your head above water, mildly splashed or paddling."
+            )
+        elif activity == 'dead':
+            lines.append(
+                "PHYSICAL STATE: You are a ghost / releasing spirit. You cannot speak normally to the living."
+            )
+
+        # Also check travel_state if activity didn't already capture it
+        travel_state = bot_state.get('travel_state')
+        if isinstance(travel_state, dict):
+            mode_travel = str(travel_state.get('mode') or '').strip().lower()
+            if mode_travel == 'taxi_flight':
+                lines.append(
+                    "TRAVEL STATE: You are currently flying on a flight master taxi mount high above the ground. "
+                    "Respond while soaring through the skies."
+                )
+            elif mode_travel in ('ground_mount', 'flying_mount') and activity != 'mounted':
+                lines.append(
+                    "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are mounted on your steed/mount. "
+                    "Respond while seated atop your mount, holding the reins."
+                )
+
+    # 4. Social & Hierarchy Relations
+    level_diff = speaker.get('level_diff')
+    if level_diff is not None:
+        try:
+            diff = int(level_diff)
+            if diff >= 15:
+                lines.append(
+                    f"RELATIVE POWER: You are a vastly higher level veteran (+{diff} levels higher than the player). "
+                    "Speak with experienced confidence."
+                )
+            elif diff <= -15:
+                lines.append(
+                    f"RELATIVE POWER: The player is a legendary high-level hero ({abs(diff)} levels above you). "
+                    "Speak with respect or awe."
+                )
+        except (ValueError, TypeError):
+            pass
+
+    if speaker.get('same_guild'):
+        lines.append(
+            "GUILD AFFILIATION: The player is a fellow guildmate. Speak with familiarity and camaraderie."
+        )
+
+    return lines
+
+
 def _insert_proximity_line(
     db,
     event_id: int,
@@ -845,6 +995,12 @@ def _single_prompt(
     lines.extend(_location_lines(
         extra, mode, [speaker], db=db,
     ))
+    if not speaker.get('is_npc'):
+        situational_lines = build_proximity_bot_situational_lines(
+            speaker, extra, mode,
+        )
+        if situational_lines:
+            lines.extend(situational_lines)
     disposition_guidance = _npc_disposition_guidance(
         speaker
     )
@@ -1034,6 +1190,12 @@ def _conversation_prompt(
         extra, mode, participants, db=db,
     ))
     lines.extend(_mixed_voice_guidance(mode))
+    for spk in participants:
+        if not spk.get('is_npc'):
+            s_lines = build_proximity_bot_situational_lines(spk, extra, mode)
+            if s_lines:
+                lines.append(f"Situational awareness for {spk.get('name', 'Bot')}:")
+                lines.extend([f"- {l}" for l in s_lines])
 
     addressable = list(nearby_names)
     if player_addressed and player_name:
@@ -1570,20 +1732,34 @@ def _player_say_single_prompt(
             channel='say',
         )]
     brief_casual = bool(extra.get('brief_casual'))
-    lines.extend([
-        (
+    is_in_combat = (
+        bool((speaker.get('bot_state') or extra.get('bot_state') or {}).get('in_combat'))
+        or (speaker.get('current_activity') == 'combat')
+    )
+    if is_in_combat:
+        length_line = "Write an urgent, breathless /say reply of 2-6 words."
+    elif brief_casual:
+        length_line = (
             "Write an extremely short /say reply using 2-8 words "
             "and no more than 50 characters."
-            if brief_casual
-            else "Write an extremely short /say reply of 8-15 words."
-        ),
-        "Keep it natural and low-stakes. No AI talk or markdown.",
+        )
+    else:
+        length_line = "Write an extremely short /say reply of 8-15 words."
+
+    lines.extend([
+        length_line,
+        "Keep it urgent and authentic to active battle. No AI talk or markdown." if is_in_combat else "Keep it natural and low-stakes. No AI talk or markdown.",
         "",
         f"Speaker: {speaker_desc}",
     ])
     lines.extend(_location_lines(
         extra, mode, [speaker], db=db,
     ))
+    situational_lines = build_proximity_bot_situational_lines(
+        speaker, extra, mode,
+    )
+    if situational_lines:
+        lines.extend(situational_lines)
     disposition_guidance = _npc_disposition_guidance(
         speaker
     )
@@ -1676,6 +1852,12 @@ def _player_say_conversation_prompt(
         extra, mode, participants, db=db,
     ))
     lines.extend(_mixed_voice_guidance(mode))
+    for spk in participants:
+        if not spk.get('is_npc'):
+            s_lines = build_proximity_bot_situational_lines(spk, extra, mode)
+            if s_lines:
+                lines.append(f"Situational awareness for {spk.get('name', 'Bot')}:")
+                lines.extend([f"- {l}" for l in s_lines])
 
     addressed = extra.get('addressed_name', '')
     if addressed:
@@ -1805,6 +1987,12 @@ def _player_emote_single_prompt(
             "Keep it natural and low-stakes. No AI talk or markdown.",
         ]
     lines.extend(_location_lines(extra, mode, [speaker], db=db))
+    if not speaker_is_npc:
+        situational_lines = build_proximity_bot_situational_lines(
+            speaker, extra, mode,
+        )
+        if situational_lines:
+            lines.extend(situational_lines)
     if speaker_is_npc:
         disposition = _npc_disposition_guidance(speaker)
         if disposition:
@@ -1893,6 +2081,12 @@ def _player_emote_conversation_prompt(
     ]
     lines.extend(_location_lines(extra, mode, participants, db=db))
     lines.extend(_mixed_voice_guidance(mode))
+    for spk in participants:
+        if not spk.get('is_npc'):
+            s_lines = build_proximity_bot_situational_lines(spk, extra, mode)
+            if s_lines:
+                lines.append(f"Situational awareness for {spk.get('name', 'Bot')}:")
+                lines.extend([f"- {l}" for l in s_lines])
     lines.extend([
         f"The player ({player_name}) "
         f"{_describe_player_emote(extra, player_emote, addressed)}.",

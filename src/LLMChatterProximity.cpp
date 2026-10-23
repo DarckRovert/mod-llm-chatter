@@ -21,6 +21,9 @@
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
 #include "ScriptedCreature.h"
+#include "Spell.h"
+#include "SpellAuraDefines.h"
+#include "SpellInfo.h"
 #include "Util.h"
 #include "Map.h"
 #include "World.h"
@@ -1165,20 +1168,113 @@ void AddSceneParticipant(
     scene.participants.push_back(participant);
 }
 
-std::string BuildBotParticipantJson(Player* bot)
+static std::string GetBotCurrentActivity(Player* bot)
 {
-    return std::string("{")
+    if (!bot || !bot->IsAlive())
+        return "dead";
+
+    if (bot->IsInCombat())
+        return "combat";
+
+    for (uint32 type = CURRENT_GENERIC_SPELL; type < CURRENT_MAX_SPELL; ++type)
+    {
+        if (Spell* spell = bot->GetCurrentSpell(static_cast<CurrentSpellTypes>(type)))
+        {
+            if (SpellInfo const* si = spell->GetSpellInfo())
+            {
+                uint8 locale = sWorld->GetDefaultDbcLocale();
+                char const* spellName = si->SpellName[locale];
+                if (!spellName || !*spellName)
+                    spellName = si->SpellName[LOCALE_enUS];
+                if (!spellName || !*spellName)
+                    spellName = si->SpellName[0];
+
+                if (spellName && spellName[0] != '\0')
+                {
+                    std::string sName = ToLowerAscii(spellName);
+                    if (sName.find("fish") != std::string::npos)
+                        return "fishing";
+                    if (sName.find("min") != std::string::npos ||
+                        sName.find("smelt") != std::string::npos ||
+                        sName.find("herb") != std::string::npos ||
+                        sName.find("skin") != std::string::npos ||
+                        sName.find("disenchant") != std::string::npos ||
+                        sName.find("opening") != std::string::npos ||
+                        sName.find("pick lock") != std::string::npos)
+                        return "gathering";
+                    if (sName.find("cook") != std::string::npos ||
+                        sName.find("first aid") != std::string::npos ||
+                        sName.find("tailor") != std::string::npos ||
+                        sName.find("leatherwork") != std::string::npos ||
+                        sName.find("blacksmith") != std::string::npos ||
+                        sName.find("alchemy") != std::string::npos ||
+                        sName.find("enchant") != std::string::npos ||
+                        sName.find("jewelcraft") != std::string::npos ||
+                        sName.find("inscription") != std::string::npos ||
+                        sName.find("engineering") != std::string::npos)
+                        return "crafting";
+                    return "casting";
+                }
+            }
+        }
+    }
+
+    if (bot->HasAura(25990)
+        || ((bot->HasAuraType(SPELL_AURA_MOD_REGEN)
+             || bot->HasAuraType(SPELL_AURA_MOD_POWER_REGEN)
+             || bot->HasAuraType(SPELL_AURA_MOD_HEALTH_REGEN_PERCENT)
+             || bot->HasAuraType(SPELL_AURA_MOD_POWER_REGEN_PERCENT))
+            && bot->IsSitState()))
+    {
+        return "eating_drinking";
+    }
+
+    if (bot->IsSitState())
+        return "sitting_resting";
+
+    if (bot->IsMounted())
+        return "mounted";
+
+    if (bot->isSwimming())
+        return "swimming";
+
+    return "standing";
+}
+
+std::string BuildBotParticipantJson(Player* bot, Player* player = nullptr)
+{
+    std::string botStateStr = BuildBotStateJson(bot);
+    std::string currentActivity = GetBotCurrentActivity(bot);
+
+    std::string json = std::string("{")
         + "\"name\":\""
         + JsonEscape(bot->GetName()) + "\","
         + "\"is_npc\":false,"
         + "\"bot_guid\":"
-        + std::to_string(
-            bot->GetGUID().GetCounter())
+        + std::to_string(bot->GetGUID().GetCounter())
         + ",\"class\":\""
         + JsonEscape(GetChatterClassName(bot->getClass()))
         + "\",\"race\":\""
         + JsonEscape(GetRaceName(bot->getRace()))
-        + "\",\"role\":\"bot\"}";
+        + "\",\"level\":"
+        + std::to_string(bot->getLevel())
+        + ",\"role\":\"bot\""
+        + ",\"current_activity\":\""
+        + JsonEscape(currentActivity) + "\"";
+
+    if (player)
+    {
+        json += ",\"level_diff\":" + std::to_string(
+            static_cast<int32>(bot->getLevel()) - static_cast<int32>(player->getLevel()));
+        if (player->GetGuildId() && player->GetGuildId() == bot->GetGuildId())
+            json += ",\"same_guild\":true";
+    }
+
+    if (!botStateStr.empty())
+        json += "," + botStateStr;
+
+    json += "}";
+    return json;
 }
 
 // A creature has no race of its own; humanoid NPCs take one
@@ -1283,7 +1379,7 @@ std::string BuildParticipantJson(
 
     if (candidate.bot)
         return BuildBotParticipantJson(
-            candidate.bot);
+            candidate.bot, player);
 
     return "{}";
 }
