@@ -16,11 +16,25 @@ from typing import Optional, Dict, List, Any
 
 logger = logging.getLogger("jaina_ai.keystore")
 
+def _resolve_canonical_keystore_path() -> str:
+    r"""Busca dinámicamente la carpeta server en la jerarquía o retorna el path canónico de E:\."""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(8):
+        direct_target = os.path.join(cur, "server", "ai_keystore.bin")
+        if os.path.exists(direct_target):
+            return direct_target
+        conf_target = os.path.join(cur, "server", "mod_llm_chatter.conf")
+        if os.path.exists(conf_target):
+            return os.path.join(cur, "server", "ai_keystore.bin")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return r"E:\JainaCore_Server\server\ai_keystore.bin"
+
+
 # Ruta canónica por defecto en disco E:\
-_DEFAULT_KEYSTORE_PATH = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
-                 "server", "data", "ai_keystore.bin")
-)
+_DEFAULT_KEYSTORE_PATH = _resolve_canonical_keystore_path()
 
 _keystore_lock = threading.RLock()
 
