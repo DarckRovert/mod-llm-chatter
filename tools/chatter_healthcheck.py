@@ -67,7 +67,8 @@ _REQUIRED_TABLES = [
 
 _VALID_PROVIDERS = (
     'anthropic', 'openai', 'google', 'openrouter', 'ollama',
-    'local', 'lmstudio', 'lemonade', 'vllm', 'localai', 'jan', 'koboldcpp', 'textgen'
+    'local', 'lmstudio', 'lemonade', 'vllm', 'localai', 'jan', 'koboldcpp', 'textgen',
+    'cloud', 'hybrid', 'enjambre', 'groq', 'nvidia', 'nvidia_nim', 'mistral', 'deepseek', 'together', 'fireworks'
 )
 
 # provider -> (api_key_config_key, example_placeholder)
@@ -235,6 +236,18 @@ def _check_provider_config(config):
         msg = f"Provider '{provider}' (motor local, no requiere API key). URL: {base_url}"
         return _result(
             'provider_config', 'LLM provider config', 'pass', msg,
+        )
+
+    if provider in ('cloud', 'hybrid', 'enjambre', 'groq', 'nvidia', 'nvidia_nim', 'mistral', 'deepseek', 'together', 'fireworks'):
+        from ai_core.ai_keystore import default_keystore
+        configured = default_keystore.list_configured(config=config)
+        if configured or provider == 'hybrid':
+            msg = f"Provider '{provider}' (enjambre soberano cloud/híbrido). Proveedores con claves activas: {', '.join(configured) or 'Motor local fallback'}"
+            return _result('provider_config', 'LLM provider config', 'pass', msg)
+        return _result(
+            'provider_config', 'LLM provider config', 'fail',
+            f"Provider '{provider}' seleccionado pero no hay claves cloud configuradas.",
+            "Configure claves en ai_keystore o mod_llm_chatter.conf (ej: LLMChatter.Groq.ApiKey o LLMChatter.Nvidia.ApiKey)."
         )
 
     key_name, placeholder = _PROVIDER_KEYS[provider]
@@ -595,7 +608,21 @@ def _check_llm_probe(config):
         endpoint = "the provider API"
 
     try:
-        if provider == 'anthropic':
+        if provider in ('cloud', 'hybrid', 'enjambre', 'groq', 'nvidia', 'nvidia_nim', 'mistral', 'deepseek', 'together', 'fireworks'):
+            from ai_core.failover_router import FailoverRouter
+            router = FailoverRouter(config)
+            text = router.dispatch([{'role': 'user', 'content': 'Reply with the single word: OK'}], max_tokens=150)
+            if text:
+                return _result(
+                    'llm_probe', 'LLM connectivity (live test)', 'pass',
+                    f"Live call succeeded via {router.active_provider} ({router.active_model}).",
+                )
+            return _result(
+                'llm_probe', 'LLM connectivity (live test)', 'fail',
+                f"The LLM returned an empty response ({target}).",
+                "Endpoint reachable but returned empty text.",
+            )
+        elif provider == 'anthropic':
             text = _probe_anthropic(config, model)
         else:
             client = _build_openai_compatible_client(

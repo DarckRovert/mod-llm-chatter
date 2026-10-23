@@ -91,8 +91,10 @@ from llm_compat import describe_model_compatibility
 from chatter_llm import (
     compatible_reasoning_effort, log_structured_target,
     reset_structured_diagnostics, resolve_model, check_structured_dependencies,
-    LOCAL_PROVIDERS, discover_local_endpoint, discover_active_model, resolve_active_model,
+    LOCAL_PROVIDERS, CLOUD_SWARM_PROVIDERS, get_failover_router,
+    discover_local_endpoint, discover_active_model, resolve_active_model,
 )
+from ai_core.endpoint_auditor import start_background_auditor
 from chatter_structured import structured_output_enabled
 
 # Configure logging
@@ -1364,14 +1366,32 @@ def main():
         if headers:
             kwargs['default_headers'] = headers
         client = openai.OpenAI(**kwargs)
+    elif provider in CLOUD_SWARM_PROVIDERS:
+        preferred_url = config.get(
+            'LLMChatter.Local.BaseUrl',
+            config.get('LLMChatter.Ollama.BaseUrl', 'http://127.0.0.1:1234')
+        )
+        discovered_url = discover_local_endpoint(preferred_url)
+        client = openai.OpenAI(
+            base_url=f"{discovered_url.rstrip('/')}/v1",
+            api_key="local"
+        )
+        router = get_failover_router(config)
+        logger.info(
+            f"[Enjambre Cloud Soberano] Inicializado con éxito. Proveedor activo: {router.active_provider} | Modelo activo: {router.active_model}"
+        )
+        try:
+            start_background_auditor(interval_seconds=1800.0, config=config)
+        except Exception as e:
+            logger.warning(f"No se pudo iniciar auditor en segundo plano: {e}")
     else:
         # Anthropic is the documented default when Provider is unset.
         # A *typo* in LLMChatter.Provider also lands here; fail loudly
         # rather than silently pretending Anthropic was intended.
-        if provider != 'anthropic' and provider not in LOCAL_PROVIDERS:
+        if provider != 'anthropic' and provider not in LOCAL_PROVIDERS and provider not in CLOUD_SWARM_PROVIDERS:
             logger.error(
                 "FATAL: unknown LLMChatter.Provider '%s'. Valid values: "
-                "anthropic, openai, google, openrouter, ollama, local, lmstudio, lemonade, vllm, jan.",
+                "anthropic, openai, google, openrouter, ollama, local, lmstudio, lemonade, vllm, jan, cloud, hybrid, groq, nvidia.",
                 provider,
             )
             sys.exit(1)

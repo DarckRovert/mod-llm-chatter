@@ -539,6 +539,26 @@ LOCAL_PROVIDERS = {
     'ollama', 'local', 'lmstudio', 'lemonade', 'vllm', 'localai', 'jan', 'koboldcpp', 'textgen'
 }
 
+CLOUD_SWARM_PROVIDERS = {
+    'cloud', 'hybrid', 'enjambre', 'swarm', 'groq', 'nvidia', 'nvidia_nim', 'mistral', 'deepseek', 'together', 'fireworks'
+}
+
+_failover_router = None
+_failover_router_lock = threading.Lock()
+
+
+def get_failover_router(config: dict):
+    """Obtiene o inicializa el enrutador singleton de tolerancia a fallos y conmutación en caliente."""
+    global _failover_router
+    with _failover_router_lock:
+        if _failover_router is None:
+            try:
+                from ai_core.failover_router import FailoverRouter
+                _failover_router = FailoverRouter(config)
+            except Exception as e:
+                logger.error(f"Error inicializando FailoverRouter: {e}")
+        return _failover_router
+
 _LOCAL_PORTS = (1234, 11434, 1337, 8000, 8080, 5001, 5000)
 _DISCOVERED_BASE_URL = None
 _DISCOVERED_MODEL = None
@@ -750,7 +770,7 @@ def get_llm_client(config):
         ):
             return _main_client
 
-        if provider in LOCAL_PROVIDERS:
+        if provider in LOCAL_PROVIDERS or provider in CLOUD_SWARM_PROVIDERS:
             import openai
             base_url = config.get(
                 'LLMChatter.Local.BaseUrl',
@@ -962,10 +982,35 @@ def call_llm(
                 else:
                     del _llm_response_cache[cache_key]
 
-    result = _call_target(
-        client, prompt, config, provider, model, max_tokens,
-        temperature, label, metadata, response_contract, free_text,
-    )
+    if provider in CLOUD_SWARM_PROVIDERS:
+        router = get_failover_router(config)
+        sys_msg, user_msg = _split_prompt(prompt)
+        messages = _build_chat_messages(sys_msg, user_msg)
+        is_short = bool(any(k in str(label).lower() for k in ('ambient', 'emote', 'proximity', 'duel', 'loot')))
+        result = router.dispatch(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            is_short_chatter=is_short,
+            local_client=client if (provider in LOCAL_PROVIDERS or provider in ('hybrid', 'local')) else None,
+            local_model=model,
+        )
+    else:
+        result = _call_target(
+            client, prompt, config, provider, model, max_tokens,
+            temperature, label, metadata, response_contract, free_text,
+        )
+        if not result and str(config.get('LLMChatter.Cloud.FailoverEnabled', '1')).strip() == '1':
+            try:
+                router = get_failover_router(config)
+                if router:
+                    sys_msg, user_msg = _split_prompt(prompt)
+                    messages = _build_chat_messages(sys_msg, user_msg)
+                    result = router._dispatch_cloud_with_failover(messages, max_tokens, temperature, timeout=12.0)
+                    if result:
+                        logger.info("[LLM-HotFailover] Conmutación automática a nube exitosa tras fallo en motor local (%s)", label)
+            except Exception as e:
+                logger.debug(f"[LLM-HotFailover] Intento de conmutación a nube falló: {e}")
 
     if enable_cache and cache_key and result:
         with _llm_cache_lock:
