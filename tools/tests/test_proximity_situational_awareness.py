@@ -316,11 +316,48 @@ def test_ambient_prompts_situational():
     assert "Situational awareness for BlacksmithJor:" in conv_p
 
 
+def test_edge_case_string_encoded_bot_state_and_addressed_fallback():
+    # Test string-encoded bot_state (double JSON encoding resilience)
+    bot_with_json_str = {
+        'name': 'Grommash',
+        'is_npc': False,
+        'bot_guid': 999,
+        'current_activity': 'combat',
+        'bot_state': '{"health_pct": 18, "mana_pct": 5, "in_combat": true, "target": "Hogger"}',
+    }
+    lines = build_proximity_bot_situational_lines(bot_with_json_str, BASE_EXTRA)
+    joined = " ".join(lines)
+    assert "fighting Hogger" in joined
+    assert "critically wounded (18% health)" in joined
+    assert "completely drained of magical energy (5% mana)" in joined
+
+    # Test addressed_participant fallback when speaker is missing bot_state
+    minimal_speaker = {'name': 'Thrall', 'is_npc': False, 'bot_guid': 1001}
+    extra_with_addr = dict(
+        BASE_EXTRA,
+        addressed_participant={
+            'name': 'Thrall',
+            'is_npc': False,
+            'current_activity': 'taxi_flight',
+            'bot_state': {'health_pct': 100, 'in_combat': False},
+            'level_diff': 20,
+            'same_guild': True,
+        },
+    )
+    lines_addr = build_proximity_bot_situational_lines(minimal_speaker, extra_with_addr)
+    joined_addr = " ".join(lines_addr)
+    assert "flying on a flight master taxi mount" in joined_addr
+    assert "vastly higher level veteran (+20 levels higher" in joined_addr
+    assert "fellow guildmate" in joined_addr
+
+
 def test_cpp_code_structure_verification():
     cpp_file = MODULE_DIR / 'src' / 'LLMChatterProximity.cpp'
     content = cpp_file.read_text(encoding='utf-8')
 
     assert 'static std::string GetBotCurrentActivity(Player* bot)' in content
+    assert 'spell->getState() == SPELL_STATE_FINISHED' in content
+    assert 'bot->IsInFlight() || bot->HasUnitState(UNIT_STATE_IN_FLIGHT)' in content
     assert 'si->SpellName' in content
     assert 'sName.find("fish")' in content
     assert 'sName.find("min")' in content
@@ -334,3 +371,4 @@ def test_cpp_code_structure_verification():
     assert r'\"same_guild\":true' in content
     assert 'BuildBotStateJson(bot)' in content
     assert 'candidate.bot, player' in content
+

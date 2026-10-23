@@ -1180,6 +1180,9 @@ static std::string GetBotCurrentActivity(Player* bot)
     {
         if (Spell* spell = bot->GetCurrentSpell(static_cast<CurrentSpellTypes>(type)))
         {
+            if (spell->getState() == SPELL_STATE_FINISHED)
+                continue;
+
             if (SpellInfo const* si = spell->GetSpellInfo())
             {
                 uint8 locale = sWorld->GetDefaultDbcLocale();
@@ -1231,6 +1234,9 @@ static std::string GetBotCurrentActivity(Player* bot)
 
     if (bot->IsSitState())
         return "sitting_resting";
+
+    if (bot->IsInFlight() || bot->HasUnitState(UNIT_STATE_IN_FLIGHT))
+        return "taxi_flight";
 
     if (bot->IsMounted())
         return "mounted";

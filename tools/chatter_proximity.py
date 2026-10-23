@@ -578,12 +578,37 @@ def build_proximity_bot_situational_lines(
 
     lines = []
     bot_state = speaker.get('bot_state')
+    if isinstance(bot_state, str):
+        try:
+            bot_state = json.loads(bot_state)
+        except Exception:
+            bot_state = None
+
+    addr_participant = extra.get('addressed_participant') if isinstance(extra, dict) and isinstance(extra.get('addressed_participant'), dict) else {}
+
     if not isinstance(bot_state, dict):
-        extra_state = extra.get('bot_state') if isinstance(extra, dict) else None
-        bot_state = extra_state if isinstance(extra_state, dict) else {}
+        if addr_participant and not addr_participant.get('is_npc'):
+            addr_state = addr_participant.get('bot_state')
+            if isinstance(addr_state, str):
+                try:
+                    addr_state = json.loads(addr_state)
+                except Exception:
+                    addr_state = None
+            if isinstance(addr_state, dict):
+                bot_state = addr_state
+
+        if not isinstance(bot_state, dict):
+            extra_state = extra.get('bot_state') if isinstance(extra, dict) else None
+            if isinstance(extra_state, str):
+                try:
+                    extra_state = json.loads(extra_state)
+                except Exception:
+                    extra_state = None
+            bot_state = extra_state if isinstance(extra_state, dict) else {}
 
     activity = str(
         speaker.get('current_activity')
+        or addr_participant.get('current_activity')
         or (extra.get('current_activity') if isinstance(extra, dict) else '')
         or ''
     ).strip().lower()
@@ -654,6 +679,11 @@ def build_proximity_bot_situational_lines(
                 "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are sitting down resting your legs and recovering. "
                 "Respond comfortably from a seated, relaxed posture."
             )
+        elif activity == 'taxi_flight':
+            lines.append(
+                "TRAVEL STATE: You are currently flying on a flight master taxi mount high above the ground. "
+                "Respond while soaring through the skies."
+            )
         elif activity == 'mounted':
             lines.append(
                 "CURRENT PHYSICAL ACTIVITY (Dual-Attention): You are mounted on your steed/mount. "
@@ -673,7 +703,7 @@ def build_proximity_bot_situational_lines(
         travel_state = bot_state.get('travel_state')
         if isinstance(travel_state, dict):
             mode_travel = str(travel_state.get('mode') or '').strip().lower()
-            if mode_travel == 'taxi_flight':
+            if mode_travel == 'taxi_flight' and activity != 'taxi_flight':
                 lines.append(
                     "TRAVEL STATE: You are currently flying on a flight master taxi mount high above the ground. "
                     "Respond while soaring through the skies."
@@ -685,7 +715,7 @@ def build_proximity_bot_situational_lines(
                 )
 
     # 4. Social & Hierarchy Relations
-    level_diff = speaker.get('level_diff')
+    level_diff = speaker.get('level_diff') if speaker.get('level_diff') is not None else addr_participant.get('level_diff')
     if level_diff is not None:
         try:
             diff = int(level_diff)
@@ -702,7 +732,7 @@ def build_proximity_bot_situational_lines(
         except (ValueError, TypeError):
             pass
 
-    if speaker.get('same_guild'):
+    if speaker.get('same_guild') or addr_participant.get('same_guild'):
         lines.append(
             "GUILD AFFILIATION: The player is a fellow guildmate. Speak with familiarity and camaraderie."
         )
