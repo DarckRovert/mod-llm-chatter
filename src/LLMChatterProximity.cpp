@@ -1263,7 +1263,7 @@ std::string BuildBotParticipantJson(Player* bot, Player* player = nullptr)
         + "\",\"race\":\""
         + JsonEscape(GetRaceName(bot->getRace()))
         + "\",\"level\":"
-        + std::to_string(bot->getLevel())
+        + std::to_string(bot->GetLevel())
         + ",\"role\":\"bot\""
         + ",\"current_activity\":\""
         + JsonEscape(currentActivity) + "\"";
@@ -1271,7 +1271,7 @@ std::string BuildBotParticipantJson(Player* bot, Player* player = nullptr)
     if (player)
     {
         json += ",\"level_diff\":" + std::to_string(
-            static_cast<int32>(bot->getLevel()) - static_cast<int32>(player->getLevel()));
+            static_cast<int32>(bot->GetLevel()) - static_cast<int32>(player->GetLevel()));
         if (player->GetGuildId() && player->GetGuildId() == bot->GetGuildId())
             json += ",\"same_guild\":true";
     }
