@@ -4,6 +4,12 @@
 
 # 🧠 mod-llm-chatter — JainaCore Neural Edition
 
+> [!WARNING]
+> ### 🛡️ OFFICIAL REPOSITORY SECURITY NOTICE / AVISO DE SEGURIDAD
+> This is the **ONLY** official repository for JainaCore LLM Chatter maintained by **[DarckRovert](https://github.com/DarckRovert)**.  
+> **Beware of fraudulent clones, bot accounts, and impersonators** (such as `Aursolstice160913-alt`, `Gel88566ight`, or similar disposable profiles) that scrape our documentation and distribute malicious loaders, trojans (infostealers), or password-protected `.zip` files through third-party download hosts (MediaFire, external domains).  
+> **JainaCore modules are open-source source code only.** We NEVER distribute binary loaders, password-protected archives, or external `.exe` installers. Any external download claiming to be an "All-in-one loader" or "Pre-compiled JainaCore release" is MALWARE.
+
 **Every hero has a story. Your companions are ready to tell theirs.**
 
 > **Distro Oficial:** Motor de diálogo con inteligencia artificial para el ecosistema **JainaCore 3.3.5a** y **mod-playerbots**.  
