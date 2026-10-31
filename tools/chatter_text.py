@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import re
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from chatter_constants import EMOTE_LIST
 
@@ -105,12 +105,82 @@ def _validate_emote(emote_str: Optional[str]) -> Optional[str]:
     return None
 
 
+_META_PATTERNS = [
+    re.compile(r'^\s*(?:the user wants|we need to output|response format|must be in spanish|must be only json)', re.IGNORECASE),
+    re.compile(r'^\s*(?:count characters|let\'s craft|actually we can have|no quotes in message)', re.IGNORECASE),
+    re.compile(r'^\s*rules?:\s*double quotes', re.IGNORECASE),
+    re.compile(r'(?:your\s+)?spoken words(?:\s+here|\s*,\s*or empty)?', re.IGNORECASE),
+    re.compile(r'palabras habladas por el personaje', re.IGNORECASE),
+    re.compile(r'diálogo breve o vacío con emote', re.IGNORECASE),
+    re.compile(r'as jaina, we can say', re.IGNORECASE),
+    re.compile(r'["\'].*?["\']\s*\(\d+\)\s*["\']', re.IGNORECASE),
+]
+
+
+def is_meta_leak(text: str) -> bool:
+    """Detect if text contains leaked LLM reasoning, token counting, or prompt instructions."""
+    if not text or not isinstance(text, str):
+        return False
+    t = text.strip()
+    for pat in _META_PATTERNS:
+        if pat.search(t):
+            return True
+    return False
+
+
+def sanitize_dialogue_quotes(text: str) -> str:
+    """Normalize and clean quotation mark artifacts in in-game dialogue."""
+    if not text:
+        return ""
+    t = text.strip().strip('"\'')
+    t = re.sub(r'"\s*"', ' ', t)
+    t = re.sub(r'([.?!,])"\s*', r'\1 ', t)
+    t = re.sub(r'\s*"([¿¡A-Za-z])', r' \1', t)
+    t = t.replace('""', '"').replace('"', '')
+    return t.strip()
+
+
+def _extract_balanced_json_objects(text: str) -> List[str]:
+    """Extract all balanced { ... } blocks from text, properly handling nested braces and quotes."""
+    objects = []
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    objects.append(text[start:i+1])
+                    start = -1
+    return objects
+
+
 def parse_single_response(response: str) -> dict:
     """Parse a single LLM response that may be JSON
     with message/emote/action fields.
 
     Returns dict with 'message', 'emote', 'action'.
-    Falls back to plain text if JSON parsing fails.
+    Falls back to plain text if JSON parsing fails,
+    with strict CoT / meta-prompt suppression.
     """
     if not response:
         return {
@@ -120,6 +190,10 @@ def parse_single_response(response: str) -> dict:
         }
 
     cleaned = response.strip()
+    # Strip <think>.*?</think> and [THINKING] tags
+    cleaned = re.sub(r'<think>.*?</think>', '', cleaned, flags=re.DOTALL).strip()
+    cleaned = re.sub(r'\[THINKING\].*?\[/THINKING\]', '', cleaned, flags=re.DOTALL).strip()
+
     # Strip ```json wrapper
     cleaned = re.sub(
         r'```(?:json)?', '', cleaned,
@@ -129,14 +203,11 @@ def parse_single_response(response: str) -> dict:
     # Try direct parse first, then extract embedded
     # JSON if the LLM leaked reasoning around it.
     candidates = [cleaned]
-    # Look for { ... } blocks containing "message".
-    # Use the last match — if the LLM revised its
-    # answer, the final JSON is the intended one.
-    matches = re.findall(
-        r'\{[^{}]*"message"[^{}]*\}', cleaned
-    )
-    if matches:
-        candidates.append(matches[-1])
+
+    # Use balanced extractor to correctly parse JSON with nested objects (e.g. thread_report)
+    balanced_blocks = [obj for obj in _extract_balanced_json_objects(cleaned) if '"message"' in obj]
+    if balanced_blocks:
+        candidates.append(balanced_blocks[-1])
 
     for candidate in candidates:
         try:
@@ -147,6 +218,12 @@ def parse_single_response(response: str) -> dict:
                     msg = msg.strip().strip('"')
                 else:
                     msg = str(msg).strip()
+
+                if is_meta_leak(msg):
+                    logger.warning("[ChatterText] Meta-instrucción CoT suprimida en JSON: %s", msg[:80])
+                    msg = ""
+                else:
+                    msg = sanitize_dialogue_quotes(msg)
 
                 # Validate emote
                 raw_emote = data.get('emote')
@@ -172,11 +249,15 @@ def parse_single_response(response: str) -> dict:
     )
     if m:
         raw = m.group(1).strip()
-        # Decode JSON escapes (\\n, \\\", etc.)
         try:
             decoded = json.loads(f'"{raw}"')
         except (json.JSONDecodeError, ValueError):
             decoded = raw
+        if is_meta_leak(decoded):
+            logger.warning("[ChatterText] Meta-instrucción CoT suprimida en regex fallback: %s", decoded[:80])
+            decoded = ""
+        else:
+            decoded = sanitize_dialogue_quotes(decoded)
         return {
             'message': decoded,
             'emote': None,
@@ -185,8 +266,6 @@ def parse_single_response(response: str) -> dict:
 
     # Tolerant fallback: unterminated "message" value
     # (truncated by max_tokens before the closing quote).
-    # Grab everything from the message field to end of
-    # buffer, then trim trailing partial JSON syntax.
     m = re.search(
         r'"message"\s*:\s*"((?:[^"\\]|\\.)*)$',
         cleaned,
@@ -197,20 +276,21 @@ def parse_single_response(response: str) -> dict:
             decoded = json.loads(f'"{raw}"')
         except (json.JSONDecodeError, ValueError):
             decoded = raw
-        # Trim trailing partial-field artifacts like
-        # ', "emote' or ', "action'
         decoded = re.sub(
             r'\s*,?\s*"(?:emote|action)\b.*$', '', decoded
         )
+        if is_meta_leak(decoded):
+            logger.warning("[ChatterText] Meta-instrucción CoT suprimida en unterminated fallback: %s", decoded[:80])
+            decoded = ""
+        else:
+            decoded = sanitize_dialogue_quotes(decoded)
         return {
             'message': decoded.strip(),
             'emote': None,
             'action': None,
         }
 
-    # Last resort: treat as plain text, but strip any
-    # leaked JSON scaffolding so users never see raw
-    # `{ "message": "...` in chat.
+    # Last resort: treat as plain text, but strictly inspect for meta leaks
     msg = cleaned.strip().strip('"')
     if msg.startswith('{'):
         m = re.search(
@@ -218,6 +298,13 @@ def parse_single_response(response: str) -> dict:
         )
         if m:
             msg = m.group(1).strip().strip('"').rstrip(',}')
+
+    if is_meta_leak(msg):
+        logger.warning("[ChatterText] Meta-instrucción CoT suprimida en Last Resort fallback: %s", msg[:80])
+        msg = ""
+    else:
+        msg = sanitize_dialogue_quotes(msg)
+
     return {
         'message': msg,
         'emote': None,

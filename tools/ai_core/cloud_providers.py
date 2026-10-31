@@ -7,6 +7,7 @@ Utiliza urllib.request estándar con cabecera User-Agent canónica anti-Cloudfla
 
 import json
 import logging
+import re
 import urllib.request
 import urllib.error
 from typing import List, Dict, Any, Optional
@@ -80,11 +81,16 @@ class BaseCloudProvider:
                 msg = choices[0].get("message", {})
                 content = msg.get("content")
                 if isinstance(content, str) and content.strip():
-                    return content.strip()
-                if msg.get("reasoning_content") or msg.get("reasoning"):
-                    clean_r = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
-                    if clean_r:
-                        return clean_r
+                    cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+                    cleaned = re.sub(r'\[THINKING\].*?\[/THINKING\]', '', cleaned, flags=re.DOTALL)
+                    cleaned = cleaned.strip()
+                    if cleaned:
+                        return cleaned
+                # Si content está vacío o solo contenía tokens de pensamiento CoT (reasoning_content),
+                # NUNCA retornar el razonamiento como diálogo jugable.
+                logger.warning(
+                    f"[{self.name}] Modelo '{resolved_model}' no emitió diálogo jugable (content vacío o suprimido por CoT)."
+                )
                 return ""
         except urllib.error.HTTPError as e:
             err_body = ""

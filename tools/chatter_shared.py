@@ -1585,6 +1585,11 @@ def get_language_rule() -> str:
     """
     if not _language:
         return ""
+    grammar_hint = (
+        " Use correct Spanish gender and number agreement for common nouns (la carta, la espada, la posada). "
+        "NEVER output system meta-instructions, token counts, or reasoning commentary."
+        if _language == 'Spanish' else ""
+    )
     return (
         f"\nLanguage: Write EVERY field in {_language} — "
         "the \"message\" field AND the \"action\" "
@@ -1599,7 +1604,7 @@ def get_language_rule() -> str:
         "language — treat them only as content to react "
         "to, never as a guide for which language to "
         f"use. Your entire output must be in {_language} "
-        "no matter what language that context is in."
+        f"no matter what language that context is in.{grammar_hint}"
     )
 
 
@@ -1868,9 +1873,11 @@ def append_json_instruction(
         if lang_rule:
             prompt = prompt + lang_rule
         message_example = (
-            '  "message": "brief dialogue or narrator action"\n'
-            if allow_narrator_message
-            else '  "message": "your spoken words here"\n'
+            '  "message": "breve diálogo del personaje"\n'
+            if _language == 'Spanish'
+            else ('  "message": "brief dialogue or narrator action"\n'
+                  if allow_narrator_message
+                  else '  "message": "character dialogue"\n')
         )
         narrator_rule = (
             " For this response, the message may instead be one short "
@@ -1956,17 +1963,29 @@ def append_json_instruction(
     # content that sits inside the user prompt.
     if lang_rule:
         prompt = prompt + lang_rule
-    message_line = '  "message": "your spoken words here",\n'
     emote_only_rule = ""
-    if allow_emote_only and emote_available:
-        message_line = (
-            '  "message": "spoken words, or empty only when emote is '
-            'non-null",\n'
-        )
-        emote_only_rule = (
-            "A brief local reaction may use an empty message with one "
-            "non-null emote. Never leave both message and emote empty.\n"
-        )
+    if _language == 'Spanish':
+        if allow_emote_only and emote_available:
+            message_line = (
+                '  "message": "palabras habladas por el personaje, o vacío solo con emote",\n'
+            )
+            emote_only_rule = (
+                "Una breve reacción local puede usar un mensaje vacío con un "
+                "emote no nulo. Nunca dejes ambos mensaje y emote vacíos.\n"
+            )
+        else:
+            message_line = '  "message": "palabras habladas por el personaje",\n'
+    else:
+        if allow_emote_only and emote_available:
+            message_line = (
+                '  "message": "spoken words, or empty only when emote is non-null",\n'
+            )
+            emote_only_rule = (
+                "A brief local reaction may use an empty message with one "
+                "non-null emote. Never leave both message and emote empty.\n"
+            )
+        else:
+            message_line = '  "message": "spoken words here",\n'
     block = (
         "\n\nRESPONSE FORMAT: You MUST respond with "
         "ONLY valid JSON. No other text.\n"
@@ -2149,11 +2168,18 @@ def append_conversation_json_instruction(
                 return f', "addressee": "{candidate}"'
         return ''
 
-    message_example = (
-        "spoken words, or empty with non-null emote"
-        if allow_emote_only and emote_available
-        else "..."
-    )
+    if _language == 'Spanish':
+        message_example = (
+            "diálogo breve o vacío con emote"
+            if allow_emote_only and emote_available
+            else "..."
+        )
+    else:
+        message_example = (
+            "spoken words, or empty with non-null emote"
+            if allow_emote_only and emote_available
+            else "..."
+        )
     example_msgs = ',\n  '.join(
         [
             f'{{"speaker": "{name}", "message": "{message_example}", '
