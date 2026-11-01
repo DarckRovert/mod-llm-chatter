@@ -120,7 +120,6 @@ class NvidiaProvider(BaseCloudProvider):
     key_id = "nvidia"
     base_url = "https://integrate.api.nvidia.com/v1"
     available_models = [
-        "meta/llama-3.2-11b-vision-instruct",
         "meta/llama-3.2-90b-vision-instruct",
         "google/diffusiongemma-26b-a4b-it",
     ]

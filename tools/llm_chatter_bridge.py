@@ -1181,7 +1181,30 @@ def _write_db_snapshot(db, snapshot_dir):
                     data, f,
                     ensure_ascii=False
                 )
-            os.replace(tmp, path)
+            # Resilient atomic replace for Windows with transient file lock retries
+            replaced = False
+            for _ in range(3):
+                try:
+                    os.replace(tmp, path)
+                    replaced = True
+                    break
+                except (PermissionError, OSError):
+                    time.sleep(0.05)
+            if not replaced:
+                try:
+                    import shutil
+                    shutil.copyfile(tmp, path)
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                except Exception as ex:
+                    logger.debug("_write_db_snapshot lock on %s: %s", fname, ex)
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
 
     except Exception:
         logger.error(

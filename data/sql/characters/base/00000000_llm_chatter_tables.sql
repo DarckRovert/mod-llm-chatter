@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS `llm_chatter_events` (
     `target_guid` INT UNSIGNED DEFAULT NULL,
     `target_name` VARCHAR(128) DEFAULT NULL,
     `target_entry` INT UNSIGNED DEFAULT NULL,
-    `extra_data` JSON DEFAULT NULL,
+    `extra_data` LONGTEXT DEFAULT NULL,
     `status` ENUM('pending', 'processing', 'completed', 'expired', 'skipped') NOT NULL DEFAULT 'pending',
     `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `react_after` TIMESTAMP NULL DEFAULT NULL,
