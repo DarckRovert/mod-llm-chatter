@@ -1086,6 +1086,19 @@ void DeliverPendingMessagesImpl()
                 emitAction();
                 sent = ai->Say(processedMessage);
             }
+            else if (channel == "whisper")
+            {
+                if (playerGuid > 0)
+                {
+                    Player* recipient = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(playerGuid));
+                    if (recipient && recipient->IsInWorld())
+                    {
+                        emitAction();
+                        bot->Whisper(processedMessage, LANG_UNIVERSAL, recipient);
+                        sent = true;
+                    }
+                }
+            }
             else if (channel == "guild")
             {
                 // The master-toggle guard above already

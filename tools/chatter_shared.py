@@ -1925,8 +1925,10 @@ def append_json_instruction(
     action_desc = ""
     if allow_action:
         action_desc = (
-            '"action": a short physical narration '
-            '(max 8 words). '
+            '"action": a short physical narration in third person '
+            '(max 8 words, e.g. "mira a su alrededor con cautela"). '
+            "Always match the speaker's gender (feminine for females e.g. 'atenta', masculine for males e.g. 'atento'). "
+            'NEVER write in first person ("miro", "pongo"). '
             "NEVER put {item:}, {quest:}, or "
             "{spell:} placeholders in action. "
             "NEVER include your own name in the "

@@ -248,6 +248,25 @@ def _generate_field(db, config, bot_guid, group_id, bot_name, field,
         key = (bot_guid, field, _snapshot(row),
                tuple(traits), group_id)
         if _cooling_down(key):
+            if field == 'tone' and fallback and tuple(row.get(k) for k in _FIELDS[:3]) == tuple(traits):
+                cursor = db.cursor()
+                try:
+                    cursor.execute(
+                        'UPDATE llm_bot_identities SET tone=%s '
+                        'WHERE bot_guid=%s AND (tone IS NULL OR TRIM(tone)="")',
+                        (fallback, bot_guid),
+                    )
+                    if group_id:
+                        cursor.execute(
+                            'UPDATE llm_group_bot_traits SET tone=%s '
+                            'WHERE bot_guid=%s AND group_id=%s AND (tone IS NULL OR TRIM(tone)="")',
+                            (fallback, bot_guid, group_id),
+                        )
+                    db.commit()
+                except Exception:
+                    _rollback(db)
+                finally:
+                    cursor.close()
             return fallback
         # End the read transaction before waiting on the network.
         db.commit()
@@ -262,6 +281,25 @@ def _generate_field(db, config, bot_guid, group_id, bot_name, field,
             value = value.rstrip('.')
         if not value:
             _failed(key, config)
+            if field == 'tone' and fallback and tuple(row.get(k) for k in _FIELDS[:3]) == tuple(traits):
+                cursor = db.cursor()
+                try:
+                    cursor.execute(
+                        'UPDATE llm_bot_identities SET tone=%s '
+                        'WHERE bot_guid=%s AND (tone IS NULL OR TRIM(tone)="")',
+                        (fallback, bot_guid),
+                    )
+                    if group_id:
+                        cursor.execute(
+                            'UPDATE llm_group_bot_traits SET tone=%s '
+                            'WHERE bot_guid=%s AND group_id=%s AND (tone IS NULL OR TRIM(tone)="")',
+                            (fallback, bot_guid, group_id),
+                        )
+                    db.commit()
+                except Exception:
+                    _rollback(db)
+                finally:
+                    cursor.close()
             return fallback
         value = value[:char_limit]
         # Lock only for the short persistence transaction, never the LLM call.
@@ -340,6 +378,20 @@ def ensure_bot_profile(db, client, config, bot_guid, bot_name=''):
             row = check_or_create_bot_identity(db, config, bot_guid, bot_name)
             if row:
                 group = _read_group(db, bot_guid)
+                if group and not _has(group.get('tone')) and row and _has(row.get('tone')):
+                    cursor = db.cursor()
+                    try:
+                        cursor.execute(
+                            'UPDATE llm_group_bot_traits SET tone=%s '
+                            'WHERE bot_guid=%s AND (tone IS NULL OR TRIM(tone)="")',
+                            (row['tone'], bot_guid),
+                        )
+                        db.commit()
+                        group['tone'] = row['tone']
+                    except Exception:
+                        _rollback(db)
+                    finally:
+                        cursor.close()
                 traits = [((group or {}).get(k) or row.get(k))
                           for k in _FIELDS[:3]]
                 source = group or row
@@ -573,7 +625,7 @@ def regenerate_missing_identity_tones(
         )
         if tone:
             generated += 1
-            logger.info(
+            logger.debug(
                 "Regenerated tone for %s (%s): %s",
                 bot_name, bot_guid, tone,
             )

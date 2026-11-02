@@ -56,7 +56,7 @@ class BaseCloudProvider:
         # causa que el modelo agote el presupuesto en su fase de pensamiento y retorne content vacío.
         # Ajustamos el límite de tokens para garantizar que la respuesta final se emita.
         is_reasoning_model = any(k in resolved_model.lower() for k in ("oss", "r1", "reason", "o1", "o3"))
-        effective_max_tokens = max(max_tokens, 250) if is_reasoning_model else max_tokens
+        effective_max_tokens = max(max_tokens, 450) if is_reasoning_model else max_tokens
 
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         payload = {
@@ -65,6 +65,8 @@ class BaseCloudProvider:
             "max_tokens": effective_max_tokens,
             "temperature": temperature,
         }
+        if self.key_id == "groq" and is_reasoning_model:
+            payload["reasoning_effort"] = "low"
 
         data_bytes = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data_bytes)

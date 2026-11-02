@@ -19,6 +19,9 @@
 - **Auto-Descubrimiento de Motores Locales:** Detección automática y enrutamiento dinámico para LM Studio, vLLM, Jan, Ollama y Lemonade sin configuración manual de URLs.
 - **Caché Semántico de Respuestas:** Almacenamiento en memoria volátil de respuestas frecuentes con tiempo de respuesta inferior a 1 ms (`0.0125 ms`), reduciendo en 100% el consumo innecesario de GPU.
 - **Sanitización de Razonamiento (Thinking Artifacts):** Filtrado automático de bloques `<think>` en modelos Qwen 2.5 / DeepSeek R1 para garantizar inmersión rolera pura en el chat de juego.
+- **Enrutamiento Omnicanal de Susurros Privados (Hito #275):** Captura autoritativa de susurros de jugadores reales (`bot_whisper_player_msg`) con despacho in-game mediante `bot->Whisper(...)`.
+- **Aislamiento Multicanal y Desacoplamiento de Hermandad (Hito #275):** Bots en grupo con jugadores humanos aislados de la charla ociosa de hermandad para erradicar respuestas cruzadas y simultáneas.
+- **Anclaje Espacial Soberano (Hito #275):** Prompts anclados estrictamente a `zone_name` y `area_name` de base de datos, eliminando alucinaciones geográficas, con narración de acciones en 3ra persona y concordancia gramatical de género.
 
 ---
 

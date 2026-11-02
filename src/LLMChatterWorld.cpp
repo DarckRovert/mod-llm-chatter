@@ -737,6 +737,25 @@ private:
             if (bot->IsInCombat())
                 continue;
 
+            // Bots actively adventuring in a party with real players should not emit solo idle chatter
+            if (Group* grp = bot->GetGroup())
+            {
+                bool hasHuman = false;
+                for (GroupReference* itr = grp->GetFirstMember(); itr != nullptr; itr = itr->next())
+                {
+                    if (Player* m = itr->GetSource())
+                    {
+                        if (!IsPlayerBot(m))
+                        {
+                            hasHuman = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasHuman)
+                    continue;
+            }
+
             uint32 guildId = bot->GetGuildId();
             if (!guildId || !activeGuilds.count(guildId))
                 continue;

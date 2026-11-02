@@ -1958,18 +1958,10 @@ DirectedSayResult QueueDirectedPlayerSayProximityEvent(
     CollectNearbyNPCs(player, radius, candidates);
     DeduplicateCandidates(candidates);
 
-    Group* playerGroup = player->GetGroup();
-    std::vector<ProximityCandidate> nonParty;
-    for (auto const& c : candidates)
-    {
-        if (c.isNPC
-            || !IsSameGroup(c.bot, playerGroup))
-            nonParty.push_back(c);
-    }
     NamedCandidateMatch named =
-        FindNamedCandidate(player, nonParty, safeMsg);
+        FindNamedCandidate(player, candidates, safeMsg);
     SelectedCandidateMatch selectedMatch =
-        FindSelectedCandidate(player, nonParty, safeMsg);
+        FindSelectedCandidate(player, candidates, safeMsg);
     bool explicitNamedOverride =
         named.candidate && named.vocative;
     if (selectedMatch.suppress
@@ -2736,8 +2728,7 @@ bool IsProximityDirectedPlayerbotEligible(
     {
         return false;
     }
-    if (IsSameGroup(bot, player->GetGroup()))
-        return false;
+    // Allow bots in same party to respond when addressed directly in /say, /yell or proximity
     return player->GetTeamId() == bot->GetTeamId();
 }
 
@@ -2801,7 +2792,7 @@ void HandleProximityPlayerSay(
         return;
 
     if (!player || IsPlayerBot(player)
-        || type != CHAT_MSG_SAY)
+        || (type != CHAT_MSG_SAY && type != CHAT_MSG_YELL))
         return;
     if (!IsEligibleProximityAnchor(player))
         return;

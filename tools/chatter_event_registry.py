@@ -520,6 +520,27 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         },
     ),
 
+    'bot_whisper_player_msg': EventSpec(
+        handler_module='chatter_group',
+        handler_func=(
+            'process_whisper_player_msg_event'
+        ),
+        producer='PlayerbotAI.cpp',
+        priority='critical',
+        description=(
+            'Bot responds to direct player whisper'
+        ),
+        payload_fields={
+            'player_name': (str, True),
+            'player_guid': (int, True),
+            'player_gender': (int, False),
+            'player_message': (str, True),
+            'bot_name': (str, True),
+            'bot_guid': (int, True),
+            'channel': (str, False),
+        },
+    ),
+
     'bot_group_general_reaction': EventSpec(
         handler_module='chatter_group_general_reaction',
         handler_func=(

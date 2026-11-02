@@ -2260,6 +2260,96 @@ def process_group_player_msg_event(
         return False
 
 
+def process_whisper_player_msg_event(db, client, config, event):
+    """Handle a bot_whisper_player_msg event.
+    A real player sent a direct /whisper to a bot.
+    The bot responds in character via /whisper.
+    """
+    event_id = event['id']
+    extra_data = parse_extra_data(
+        event.get('extra_data'),
+        event_id,
+        'bot_whisper_player_msg'
+    )
+    if not extra_data:
+        _mark_event(db, event_id, 'skipped')
+        return False
+
+    player_name = extra_data.get('player_name', 'someone')
+    player_guid = int(extra_data.get('player_guid') or 0)
+    player_message = extra_data.get('player_message', '').strip()
+    bot_name = extra_data.get('bot_name', '')
+    bot_guid = int(extra_data.get('bot_guid') or 0)
+
+    if not player_guid or not bot_guid or not player_message:
+        _mark_event(db, event_id, 'skipped')
+        return False
+
+    try:
+        from chatter_persona import resolve_persona
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT name, class, race, gender, level "
+            "FROM characters WHERE guid = %s",
+            (bot_guid,),
+        )
+        base = cursor.fetchone()
+        if not base:
+            _mark_event(db, event_id, 'skipped')
+            return False
+
+        persona = resolve_persona(
+            db, bot_guid, base.get('name') or bot_name,
+            'roleplay'
+        )
+
+        prompt_lines = [
+            f"You are {bot_name}, a level {base.get('level')} {get_race_name(base.get('race'))} {get_class_name(base.get('class'))}.",
+            f"Personality: {', '.join(persona.traits)}." if persona.traits else "",
+            f"Tone: {persona.tone}." if persona.tone else "",
+            f"Backstory: {persona.backstory}." if persona.backstory else "",
+            f"{player_name} just sent you a private whisper in World of Warcraft:",
+            f'"{player_message}"',
+            "Reply directly to this player in a single concise sentence (max 18 words). Stay fully in character. Do NOT break character."
+        ]
+        prompt = "\n".join(line for line in prompt_lines if line)
+        prompt = append_json_instruction(prompt, allow_action=False, skip_emote=True, message_only=True)
+
+        response = call_llm(
+            client, prompt, config,
+            max_tokens_override=60,
+            context=f"whisper:#{event_id}:{bot_name}"
+        )
+        if not response:
+            _mark_event(db, event_id, 'skipped')
+            return False
+
+        parsed = parse_single_response(response)
+        msg_text = strip_speaker_prefix(parsed.get('message', ''), bot_name)
+        msg_text = cleanup_message(msg_text)
+        if not msg_text:
+            _mark_event(db, event_id, 'skipped')
+            return False
+
+        insert_chat_message(
+            db, bot_guid, bot_name, msg_text,
+            channel='whisper', delay_seconds=1.0,
+            event_id=event_id, player_guid=player_guid,
+            config=config
+        )
+
+        _mark_event(db, event_id, 'completed')
+        return True
+
+    except Exception:
+        logger.error(
+            "process_whisper_player_msg_event failed event=%d",
+            event_id, exc_info=True
+        )
+        _mark_event(db, event_id, 'skipped')
+        return False
+
+
 def _maybe_queue_player_msg_memory(
     config, group_id, player_message, all_bots,
     player_name="",

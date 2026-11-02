@@ -368,17 +368,16 @@ def _build_guild_prompt(
                         f"{zone} naturally for context."
                     )
             else:
-                # RNG said no: forbid referencing the location at all this
-                # round so we never get a deictic line with no place name.
+                # Ground location to real zone; prevent inventing fictional places or claiming to be lost elsewhere
                 if roleplay:
                     lines.append(
-                        "Most guildmates are far away and cannot see where "
-                        "you are. Do not describe your current surroundings."
+                        f"You are currently in {zone}. Speak about general matters, adventures, or guild life. "
+                        "Do NOT invent fictional places or claim to be lost in different or imaginary locations."
                     )
                 else:
                     lines.append(
-                        "Do not mention your character's current location or "
-                        "nearby game-world details this time."
+                        f"Your character is currently in {zone}. Speak about general topics. "
+                        "Do not mention false locations."
                     )
     if thread_turn is not None:
         # The guild's conversation thread replaces the random
@@ -491,6 +490,18 @@ def _process_guild_statement_event(
     if not speaker or not speaker_name:
         _mark_event(db, event_id, 'skipped')
         return False
+
+    try:
+        chk_cur = db.cursor()
+        chk_cur.execute(
+            "SELECT group_id FROM llm_group_bot_traits WHERE bot_guid = %s",
+            (speaker_guid,),
+        )
+        if chk_cur.fetchone():
+            _mark_event(db, event_id, 'skipped')
+            return False
+    except Exception:
+        pass
 
     speaker = prepare_guild_speakers(
         db, client, config,
@@ -1687,6 +1698,18 @@ def process_guild_idle_chatter_event(
     if not participants:
         _mark_event(db, event_id, 'skipped')
         return False
+
+    try:
+        chk_cur = db.cursor()
+        chk_cur.execute(
+            "SELECT group_id FROM llm_group_bot_traits WHERE bot_guid = %s",
+            (participants[0]['guid'],),
+        )
+        if chk_cur.fetchone():
+            _mark_event(db, event_id, 'skipped')
+            return False
+    except Exception:
+        pass
 
     loaded_participants = []
     for index, participant in enumerate(participants):

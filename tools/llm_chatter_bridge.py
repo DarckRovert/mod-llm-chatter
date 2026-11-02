@@ -2027,6 +2027,7 @@ def main():
     bot_question_future = None
     legacy_future = None
     tone_regen_future = None
+    last_tone_regen = 0
     guild_profile_future = None
     last_guild_profile_scan = 0
     # Track online→offline transition for full wipe
@@ -2201,7 +2202,13 @@ def main():
                 if (
                     players_online
                     and not tone_regen_future
+                    and current_time - last_tone_regen
+                    >= profile_config_int(
+                        config, 'LLMChatter.Profile.ToneRegenIntervalSeconds',
+                        30, 5,
+                    )
                 ):
+                    last_tone_regen = current_time
                     tone_regen_future = (
                         executor.submit(
                             _run_in_worker,

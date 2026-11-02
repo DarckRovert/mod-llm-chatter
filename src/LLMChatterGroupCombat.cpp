@@ -910,7 +910,10 @@ void HandleGroupPlayerBeforeSendChatMessageImpl(
     }
 
     if (type != CHAT_MSG_PARTY
-        && type != CHAT_MSG_PARTY_LEADER)
+        && type != CHAT_MSG_PARTY_LEADER
+        && type != CHAT_MSG_RAID
+        && type != CHAT_MSG_RAID_LEADER
+        && type != CHAT_MSG_RAID_WARNING)
         return;
 
     if (!sLLMChatterConfig->IsEnabled()

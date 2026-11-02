@@ -301,10 +301,11 @@ bool ContainsNameWithBoundary(
 
 std::vector<Player*> GetEligibleGuildBots(
     uint32 guildId,
-    TeamId playerTeam,
+    Player* player,
     std::string const& playerMessage,
     uint32 maxCandidates)
 {
+    TeamId playerTeam = player ? player->GetTeamId() : TEAM_ALLIANCE;
     std::vector<Player*> mentionedBots;
     std::vector<Player*> otherBots;
     auto allBots = sRandomPlayerbotMgr.GetAllBots();
@@ -323,6 +324,13 @@ std::vector<Player*> GetEligibleGuildBots(
         WorldSession* session = bot->GetSession();
         if (!session || session->PlayerLoading())
             continue;
+
+        // If bot is in the same party as the player, don't hijack general guild chat unless specifically named
+        if (player && bot->GetGroup() && bot->GetGroup() == player->GetGroup())
+        {
+            if (!ContainsNameWithBoundary(playerMessage, bot->GetName()))
+                continue;
+        }
 
         if (ContainsNameWithBoundary(
                 playerMessage, bot->GetName()))
@@ -463,7 +471,7 @@ void HandleGuildPlayerMessage(
     std::vector<Player*> bots =
         GetEligibleGuildBots(
             guildId,
-            player->GetTeamId(),
+            player,
             message,
             sLLMChatterConfig
                 ->_guildPlayerReplyMaxCandidates);
@@ -628,7 +636,7 @@ bool QueueGuildLoginGreeting(
     std::vector<Player*> bots =
         GetEligibleGuildBots(
             pending.guildId,
-            player->GetTeamId(),
+            player,
             "",
             sLLMChatterConfig
                 ->_guildLoginGreetingMaxCandidates);
