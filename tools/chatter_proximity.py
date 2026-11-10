@@ -1804,15 +1804,21 @@ def _player_say_single_prompt(
     addressed = extra.get('addressed_name', '')
     if addressed:
         lines.append(
-            f"The player ({player_name}) is "
+            f"The adventurer ({player_name}) is "
             f"addressing {addressed} directly."
         )
     lines.append(
-        f"A nearby player ({player_name}) said: "
+        f"A nearby adventurer ({player_name}) said: "
         f"{player_message}"
     )
     lines.append(
-        "Respond naturally to the player's words."
+        "Respond naturally in-character as an inhabitant of Azeroth. Never say 'player' or break the fourth wall."
+    )
+    lines.append(
+        "If the adventurer's words are in an unknown tongue or gibberish, react with in-character confusion or suspicion."
+    )
+    lines.append(
+        "CRITICAL: Do NOT repeat any phrase or greeting already spoken recently in the nearby conversation."
     )
     lines.append(build_conversational_scale_guidance(
         force_brief=bool(extra.get('brief_casual')),
@@ -2147,13 +2153,15 @@ def _player_emote_conversation_prompt(
     )
     if interaction_mode == 'npc_aside':
         lines.extend([
-            "The speakers discuss the player's real action with each other.",
-            "Do not address the player or invent speech for them.",
-            "Speakers address only each other, never the player.",
+            "The speakers discuss what just happened with each other.",
+            "Do not address the adventurer directly or invent speech for them.",
+            "Speakers speak strictly in-character as guards or citizens of Azeroth.",
+            "Never break the fourth wall. Never use the word 'player' or 'jugador'.",
+            "Do NOT repeat any phrase or sentence already spoken in recent conversation.",
         ])
     else:
         lines.append(
-            "Speakers may react to the player and to each other."
+            "Speakers may react in-character to the adventurer and to each other."
         )
     history_block = _format_history_block(history or [])
     if history_block:

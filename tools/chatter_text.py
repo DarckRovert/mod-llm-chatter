@@ -298,6 +298,13 @@ def parse_single_response(response: str) -> dict:
         )
         if m:
             msg = m.group(1).strip().strip('"').rstrip(',}')
+        else:
+            msg = ""
+
+    # Sanear cualquier residuo de llaves, corchetes o basura JSON aislada
+    msg = msg.strip()
+    if msg.startswith('{') or msg.startswith('}') or not any(c.isalnum() for c in msg):
+        msg = ""
 
     if is_meta_leak(msg):
         logger.warning("[ChatterText] Meta-instrucción CoT suprimida en Last Resort fallback: %s", msg[:80])

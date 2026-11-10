@@ -3016,6 +3016,9 @@ def parse_conversation_response(
                     continue
                 speaker = str(msg.get('speaker') or '').strip()
                 message = str(msg.get('message') or '').strip()
+                # Filtrar residuos de JSON, llaves huérfanas o texto sin contenido alfanumérico
+                if message.startswith('{') or message.startswith('}') or not any(c.isalnum() for c in message):
+                    message = ""
                 raw_emote = msg.get('emote')
                 emote = validate_emote(raw_emote)
                 if speaker and (
