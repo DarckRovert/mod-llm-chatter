@@ -578,6 +578,7 @@ def get_bound_player_group(
                 ON bot_gm.guid = t.group_id
                 AND bot_gm.memberGuid = t.bot_guid
             WHERE t.group_id = %s
+              AND t.bot_guid NOT IN (1002, 1003, 2284, 1005)
             ORDER BY RAND()
             LIMIT 1
         """, (row['group_id'],))
@@ -623,6 +624,7 @@ def get_active_group_fallback(db) -> 'dict | None':
                 AND pt.bot_guid = gm.memberGuid
             WHERE pt.bot_guid IS NULL
               AND a.username NOT LIKE 'RNDBOT%'
+              AND t.bot_guid NOT IN (1002, 1003, 2284, 1005)
             ORDER BY RAND()
             LIMIT 1
         """)

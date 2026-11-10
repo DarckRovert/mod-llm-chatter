@@ -10,6 +10,7 @@ using the same RNG-gated pattern as nearby object events.
 
 import random
 
+from chatter_constants import is_hero_bot
 from chatter_db import (
     fail_event,
     get_group_location,
@@ -103,6 +104,9 @@ def handle_screenshot_observation(db, client, config, event):
 
     bot_guid      = int(extra.get('bot_guid') or 0)
     bot_name      = extra.get('bot_name', 'Bot')
+    if is_hero_bot(guid=bot_guid, name=bot_name):
+        _mark_event(db, event_id, 'skipped')
+        return False
     group_id      = int(extra.get('group_id') or 0)
     weather       = extra.get('weather', 'none')
     time_of_day   = extra.get('time_of_day', 'unknown')
@@ -207,7 +211,10 @@ def handle_screenshot_observation(db, client, config, event):
         recent_bot_msgs)
 
     # -- Decide: conversation or single statement? --
-    members = get_group_members(db, group_id)
+    members = [
+        m for m in get_group_members(db, group_id)
+        if not is_hero_bot(name=m)
+    ]
     conv_chance = int(config.get(
         'LLMChatter.Screenshot.ConversationChance',
         40,
@@ -445,8 +452,14 @@ def _screenshot_conversation(
 
     # Pick 2-3 random bots, ensure triggering bot
     # is included
-    num_pick = random.randint(2, min(len(members), 3))
-    other_names = [m for m in members if m != bot_name]
+    other_names = [
+        m for m in members
+        if m != bot_name and not is_hero_bot(name=m)
+    ]
+    if is_hero_bot(guid=bot_guid, name=bot_name) or not other_names:
+        _mark_event(db, event_id, 'skipped')
+        return False
+    num_pick = random.randint(2, min(len(other_names) + 1, 3))
     random.shuffle(other_names)
     picked = [bot_name] + other_names[:num_pick - 1]
     random.shuffle(picked)

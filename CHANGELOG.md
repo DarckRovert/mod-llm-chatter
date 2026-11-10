@@ -1,5 +1,10 @@
 # Changelog
 
+### 2026-11-10 - HeroBot Sovereignty Exclusion & In-Character Guardrails (Hito #341)
+
+* **HeroBot SSOT Exclusion (`chatter_constants.py` & bridge/handlers)**: Added `HEROBOT_EXCLUDED_GUIDS`, `HEROBOT_EXCLUDED_NAMES`, and `is_hero_bot(guid, name)` filtering across ambient, duel, emote, group, guild, loot, proximity, raid, screenshot, and world event chatter handlers as well as `llm_chatter_bridge.py` and `screenshot_agent.py`, preventing `mod-llm-chatter` from impersonating Sovereign HeroBots (`1002`, `1003`, `2284`, `1005`).
+* **In-Character Duel Guardrails (`chatter_duel.py`)**: Reinforced prompt constraints banning out-of-character video-game meta phrases during duels.
+
 ### 2026-10-06 - LF Line Endings
 
 * **Repository**: Add `.gitattributes` forcing LF line endings, so

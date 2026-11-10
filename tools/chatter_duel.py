@@ -142,6 +142,7 @@ def _build_duel_prompt(
         f"abuse, or hateful language\n"
         "- Let your personality show in how you say it, "
         f"without naming your traits\n"
+        f"- In-character only: NEVER use out-of-character video game meta phrases (e.g. 'seguir con el juego', 'videojuego', 'partida', 'siguiente nivel'). Speak strictly as an adventurer in Azeroth\n"
         f"- Don't repeat jokes or themes "
         f"already said in chat"
     )

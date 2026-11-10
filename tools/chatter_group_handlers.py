@@ -49,7 +49,7 @@ from chatter_party_gate import (
     defer_event_for_party_gate,
     should_defer_party_generation,
 )
-from chatter_constants import BG_MAP_NAMES, RAID_MAP_IDS
+from chatter_constants import BG_MAP_NAMES, RAID_MAP_IDS, is_hero_bot
 from chatter_text import (
     strip_speaker_prefix,
     cleanup_message,
@@ -2049,7 +2049,13 @@ def _pick_group_speaker(db, group_id):
         "WHERE group_id = %s",
         (group_id,),
     )
-    rows = cursor.fetchall()
+    rows = [
+        r for r in cursor.fetchall()
+        if not is_hero_bot(
+            guid=r.get('bot_guid'),
+            name=r.get('bot_name'),
+        )
+    ]
     cursor.close()
     return random.choice(rows) if rows else None
 
@@ -2344,7 +2350,7 @@ def process_group_nearby_object_event(
     group_id = int(extra.get('group_id', 0))
     objects = extra.get('objects', [])
 
-    if not objects or not bot_guid:
+    if not objects or not bot_guid or is_hero_bot(guid=bot_guid, name=bot_name):
         _mark_event(db, event_id, 'skipped')
         return False
 
@@ -2512,12 +2518,15 @@ def _nearby_object_conversation(
 
     # Pick 2 to min(4, num_members) random bots.
     # Ensure the triggering bot is included.
-    num_pick = random.randint(
-        2, min(len(members), 4)
-    )
     other_names = [
-        m for m in members if m != bot_name
+        m for m in members
+        if m != bot_name and not is_hero_bot(name=m)
     ]
+    if is_hero_bot(guid=bot_guid, name=bot_name) or not other_names:
+        return False
+    num_pick = random.randint(
+        2, min(len(other_names) + 1, 4)
+    )
     random.shuffle(other_names)
     picked = [bot_name] + other_names[
         :num_pick - 1
@@ -2744,15 +2753,26 @@ def execute_player_msg_conversation(
 
     Returns True on success.
     """
-    # Pick 2-3 bots total. Addressed bot is first.
-    max_conv_bots = min(
-        random.randint(2, 3), len(all_bots)
-    )
-    # Get other bots (not addressed)
+    if is_hero_bot(
+        guid=addressed_bot.get('guid'),
+        name=addressed_bot.get('name'),
+    ):
+        return False
+    # Get other bots (not addressed), excluding HeroBots
     other_bots = [
         b for b in all_bots
         if b['bot_guid'] != addressed_bot['guid']
+        and not is_hero_bot(
+            guid=b.get('bot_guid'),
+            name=b.get('bot_name'),
+        )
     ]
+    if not other_bots:
+        return False
+    # Pick 2-3 bots total. Addressed bot is first.
+    max_conv_bots = min(
+        random.randint(2, 3), len(other_bots) + 1
+    )
     random.shuffle(other_bots)
     extra_count = max_conv_bots - 1
     extra_rows = other_bots[:extra_count]
@@ -3053,12 +3073,15 @@ def _quest_conversation_pick_bots(
     (bots, traits_map, bot_guids) or None
     if fewer than 2 bots are available.
     """
-    num_pick = random.randint(
-        2, min(len(members), 3)
-    )
     other_names = [
-        m for m in members if m != reactor_name
+        m for m in members
+        if m != reactor_name and not is_hero_bot(name=m)
     ]
+    if is_hero_bot(name=reactor_name) or not other_names:
+        return None
+    num_pick = random.randint(
+        2, min(len(other_names) + 1, 3)
+    )
     random.shuffle(other_names)
     picked = [reactor_name] + other_names[
         :num_pick - 1

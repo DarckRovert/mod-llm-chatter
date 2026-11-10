@@ -4079,3 +4079,35 @@ GUILD_CHAT_TOPICS_RP = [
     "a debt of honor still unpaid",
     "the names of those you've lost",
 ]
+
+
+# =============================================================================
+# HEROBOT SOVEREIGNTY EXCLUSION (Hito #341)
+# =============================================================================
+# HeroBots (Jaina 1002, Varian 1003, Thrall 2284, Sylvanas 1005) pertenecen en
+# exclusiva a LoreEngine/01_LoreBot y jamás deben emitir diálogos desde
+# mod-llm-chatter. Definido aquí (módulo puro) para evitar importaciones
+# circulares entre chatter_db y chatter_shared.
+HEROBOT_EXCLUDED_GUIDS = frozenset({1002, 1003, 2284, 1005})
+HEROBOT_EXCLUDED_NAMES = frozenset({
+    "jaina", "lady jaina", "lady jaina proudmoore",
+    "varian", "king varian", "king varian wrynn",
+    "thrall", "warchief thrall",
+    "sylvanas", "lady sylvanas", "lady sylvanas windrunner",
+})
+
+
+def is_hero_bot(guid=None, name=None) -> bool:
+    """Return True if guid or name identifies a sovereign LoreEngine HeroBot."""
+    if guid is not None:
+        try:
+            if int(guid) in HEROBOT_EXCLUDED_GUIDS:
+                return True
+        except (ValueError, TypeError):
+            pass
+    if name is not None:
+        clean = str(name).strip().lower()
+        if clean in HEROBOT_EXCLUDED_NAMES:
+            return True
+    return False
+

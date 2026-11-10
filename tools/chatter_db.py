@@ -17,6 +17,7 @@ from chatter_constants import (
     WEAPON_SUBCLASS_NAMES,
     ZONE_COORDINATES,
     ZONE_LEVELS,
+    is_hero_bot,
 )
 from chatter_text import split_action_prefix
 from spell_names import SPELL_DESCRIPTIONS, SPELL_NAMES
@@ -646,6 +647,17 @@ def insert_chat_message(
     battleground crowd) MUST pass it explicitly ('raid'/'bg')
     so they are not silenced by GroupChatter.Enable.
     """
+    # Hard SSOT HeroBot isolation: never allow mod-llm-chatter to emit as
+    # Jaina/Varian/Thrall/Sylvanas regardless of which upstream subsystem called us.
+    if is_hero_bot(guid=bot_guid, name=bot_name):
+        logger.debug(
+            "[HEROBOT-GATE] Blocked outbound chatter message for HeroBot guid=%s name=%s channel=%s",
+            bot_guid,
+            bot_name,
+            channel,
+        )
+        return None
+
     if owner_subsystem is None:
         if channel in ('party', 'raid'):
             # Group is the dominant party/raid producer.

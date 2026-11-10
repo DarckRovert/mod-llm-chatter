@@ -13,6 +13,7 @@ from typing import List
 from chatter_constants import (
     AMBIENT_CHAT_TOPICS,
     AMBIENT_CHAT_TOPICS_RP,
+    is_hero_bot,
 )
 from chatter_shared import (
     parse_single_response,
@@ -254,6 +255,9 @@ def process_statement(
     db, cursor, client, config, request, bot: dict
 ):
     """Process a single statement request."""
+    if is_hero_bot(guid=bot.get('guid'), name=bot.get('name')):
+        return False
+
     channel = 'general'
 
     # Select message type
@@ -560,6 +564,13 @@ def process_conversation(
         bots: List of 2-4 bot dicts with guid, name,
               class, race, level, zone
     """
+    bots = [
+        b for b in (bots or [])
+        if not is_hero_bot(guid=b.get('guid'), name=b.get('name'))
+    ]
+    if len(bots) < 2:
+        return False
+
     channel = 'general'
     bot_count = len(bots)
     bot_names = [b['name'] for b in bots]

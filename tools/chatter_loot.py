@@ -7,6 +7,7 @@ into one General-channel message.
 
 import logging
 
+from chatter_constants import is_hero_bot
 from chatter_db import (
     get_bots_by_guid,
     get_recent_zone_messages,
@@ -121,6 +122,8 @@ def process_general_loot_event(db, client, config, event):
 
     if subject_guid <= 0 or zone_id <= 0:
         return _skip(db, event_id, 'missing bot or zone GUID')
+    if is_hero_bot(guid=subject_guid):
+        return _skip(db, event_id, 'HeroBot isolated in LoreEngine')
 
     extra_data = parse_extra_data(
         event.get('extra_data'),
@@ -132,8 +135,8 @@ def process_general_loot_event(db, client, config, event):
         return _skip(db, event_id, 'invalid item snapshot')
 
     bot = _resolve_looter(db, subject_guid)
-    if not bot:
-        return _skip(db, event_id, 'looter is offline or not a bot')
+    if not bot or is_hero_bot(guid=bot.get('guid'), name=bot.get('name')):
+        return _skip(db, event_id, 'looter is offline, HeroBot, or not a bot')
 
     bot['zone'] = get_zone_name(zone_id) or 'the world'
     can_use = can_class_use_item(

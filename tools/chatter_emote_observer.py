@@ -12,6 +12,7 @@ from chatter_constants import (
     REACTION_TONES,
     CLASS_NAMES,
     RACE_NAMES,
+    is_hero_bot,
 )
 from chatter_shared import (
     parse_extra_data,
@@ -73,6 +74,9 @@ def handle_emote_observer(db, client, config, event):
     npc_subname = extra.get('npc_subname', '')
     group_id = int(extra.get('group_id') or 0)
     bot_guid = int(extra.get('bot_guid') or 0)
+    if is_hero_bot(guid=bot_guid, name=bot_name):
+        _mark_event(db, event_id, 'skipped')
+        return False
     bot_class = CLASS_NAMES.get(
         int(extra.get('bot_class') or 0), ''
     )

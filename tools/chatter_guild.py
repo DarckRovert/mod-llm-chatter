@@ -107,6 +107,7 @@ def _query_speaker(db, bot_guid: int) -> Dict[str, object]:
 from chatter_constants import (
     GUILD_CHAT_TOPICS,
     GUILD_CHAT_TOPICS_RP,
+    is_hero_bot,
 )
 from chatter_general import _pick_length_hint
 from chatter_mode import (
@@ -890,6 +891,7 @@ def _normalize_guild_participants(
             if (
                 not guid
                 or not name
+                or is_hero_bot(guid=guid, name=name)
                 or guid in seen_guids
                 or name_key in seen_names
             ):
@@ -910,7 +912,7 @@ def _normalize_guild_participants(
             or extra.get('speaker_name')
             or ''
         ).strip()
-        if guid and name:
+        if guid and name and not is_hero_bot(guid=guid, name=name):
             participants.append({
                 'guid': guid,
                 'name': name,

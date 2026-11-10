@@ -14,6 +14,7 @@ EVENT_HANDLERS dispatch map with no fallthrough.
 import logging
 import random
 
+from chatter_constants import is_hero_bot
 from chatter_db import (
     get_zone_bot_candidates,
     get_bots_by_guid,
@@ -98,6 +99,10 @@ def _resolve_bots(db, event, extra_data, zone_id):
             for b in get_bots_by_guid(
                 cursor, guid_list
             )
+            if not is_hero_bot(
+                guid=b.get('bot1_guid'),
+                name=b.get('bot1_name'),
+            )
         ]
         cursor.close()
         return (bots or None), True
@@ -107,6 +112,10 @@ def _resolve_bots(db, event, extra_data, zone_id):
         _normalize_bot(b)
         for b in get_zone_bot_candidates(
             cursor, zone_id=zone_id
+        )
+        if not is_hero_bot(
+            guid=b.get('bot1_guid'),
+            name=b.get('bot1_name'),
         )
     ]
     cursor.close()

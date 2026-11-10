@@ -82,6 +82,7 @@ from chatter_shared import (
     brief_casual_response_fits,
     bound_brief_casual_response,
     build_brief_casual_repair_prompt,
+    is_hero_bot,
 )
 from chatter_db import (
     get_character_info_by_name,
@@ -1598,7 +1599,9 @@ def _find_existing_welcomer(
     candidates = []
     for row in rows:
         guid = row['bot_guid']
-        if guid not in exclude_guids:
+        if guid not in exclude_guids and not is_hero_bot(
+            guid=guid, name=row.get('bot_name')
+        ):
             candidates.append({
                 'guid': guid,
                 'name': row['bot_name'],
@@ -1790,6 +1793,10 @@ def process_group_player_msg_event(
         all_bots,
         player_row.get('race') if player_row else None,
     )
+    all_bots = [
+        b for b in all_bots
+        if not is_hero_bot(guid=b.get('bot_guid'), name=b.get('bot_name'))
+    ]
 
     if not all_bots:
         _mark_event(db, event_id, 'skipped')
@@ -2281,7 +2288,9 @@ def process_whisper_player_msg_event(db, client, config, event):
     bot_name = extra_data.get('bot_name', '')
     bot_guid = int(extra_data.get('bot_guid') or 0)
 
-    if not player_guid or not bot_guid or not player_message:
+    if not player_guid or not bot_guid or not player_message or is_hero_bot(
+        guid=bot_guid, name=bot_name
+    ):
         _mark_event(db, event_id, 'skipped')
         return False
 
@@ -4148,6 +4157,10 @@ def check_idle_group_chatter(
             ORDER BY RAND()
         """, (group_id,))
         all_bots = cursor.fetchall()
+        all_bots = [
+            b for b in all_bots
+            if not is_hero_bot(guid=b.get('bot_guid'), name=b.get('bot_name'))
+        ]
 
         if not all_bots:
             if _dbg:
@@ -4678,6 +4691,14 @@ def _idle_conversation(
     inserts staggered messages, and stores in
     chat history.
     """
+
+    # Exclude HeroBots before selecting idle conversation speakers
+    bot_rows = [
+        b for b in (bot_rows or [])
+        if not is_hero_bot(guid=b.get('bot_guid'), name=b.get('bot_name'))
+    ]
+    if len(bot_rows) < 2:
+        return False
 
     # Pick how many bots participate (2 to 4)
     num_bots = random.randint(
@@ -5242,6 +5263,10 @@ def check_bot_questions(db, client, config):
             ORDER BY RAND()
         """, (group_id,))
         all_bots = cursor.fetchall()
+        all_bots = [
+            b for b in all_bots
+            if not is_hero_bot(guid=b.get('bot_guid'), name=b.get('bot_name'))
+        ]
 
         if not all_bots:
             return False

@@ -13,6 +13,7 @@ import logging
 import random
 from typing import Any, Callable, Dict, List, Optional
 
+from chatter_constants import is_hero_bot
 from chatter_shared import (
     get_class_name,
     get_gender_label,
@@ -286,7 +287,10 @@ def fire_subgroup_worker(
     extra_data['_db'] = db
     extra_data['_config'] = config
 
-    party_guids = get_subgroup_bots(extra_data)
+    party_guids = [
+        g for g in get_subgroup_bots(extra_data)
+        if not is_hero_bot(guid=g)
+    ]
     if not party_guids:
         LOG.info(
             "Skipped: subgroup worker "
@@ -294,11 +298,10 @@ def fire_subgroup_worker(
         return {}
 
     if speaker_guid:
-        if int(speaker_guid) not in party_guids:
+        if is_hero_bot(guid=speaker_guid) or int(speaker_guid) not in party_guids:
             LOG.info(
                 "Skipped: subgroup worker "
-                "(speaker %s not in player's "
-                "sub-group)", speaker_guid)
+                "(speaker %s not eligible or HeroBot)", speaker_guid)
             return {}
         bot_guid = int(speaker_guid)
     else:
@@ -319,6 +322,8 @@ def fire_subgroup_worker(
             return {}
 
     bot_name = trait_data['bot_name']
+    if is_hero_bot(guid=bot_guid, name=bot_name):
+        return {}
 
     # get_bot_traits() doesn't return race/class
     # — enrich from characters table so prompt
@@ -432,6 +437,7 @@ def fire_raid_worker(
     available = [
         g for g in raid_guids
         if g not in (exclude_guids or [])
+        and not is_hero_bot(guid=g)
     ]
     if not available:
         return {}
@@ -447,6 +453,8 @@ def fire_raid_worker(
         return {}
 
     bot_name = bot_data['bot_name']
+    if is_hero_bot(guid=bot_guid, name=bot_name):
+        return {}
 
     # Talent injection for BG raid worker
     bot_class = bot_data.get('class', '')

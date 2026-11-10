@@ -13,6 +13,7 @@ from chatter_constants import (
     PROXIMITY_PLAYER_WEATHER_TOPICS,
     PROXIMITY_WEATHER_TOPICS,
     REACTION_TONES,
+    is_hero_bot,
 )
 from chatter_proximity_pacing import proximity_line_delays
 from chatter_db import insert_chat_message
@@ -740,6 +741,15 @@ def build_proximity_bot_situational_lines(
     return lines
 
 
+def _filter_non_herobot_participants(participants) -> List[Dict]:
+    """Exclude sovereign LoreEngine HeroBots (Playerbot or NPC) from proximity chatter."""
+    return [
+        p for p in (participants or [])
+        if isinstance(p, dict)
+        and not is_hero_bot(guid=p.get('bot_guid'), name=p.get('name'))
+    ]
+
+
 def _insert_proximity_line(
     db,
     event_id: int,
@@ -751,6 +761,10 @@ def _insert_proximity_line(
     *,
     allow_emote_only: bool = False,
 ) -> bool:
+    if is_hero_bot(
+        guid=speaker.get('bot_guid'), name=speaker.get('name')
+    ):
+        return False
     raw_message = parsed.get('message', '')
     message = strip_speaker_prefix(
         raw_message, speaker.get('name', '')
@@ -1336,7 +1350,9 @@ def handle_proximity_say(db, client, config, event):
         event_id,
         'proximity_say',
     )
-    participants = extra.get('participants') or []
+    participants = _filter_non_herobot_participants(
+        extra.get('participants')
+    )
     if not participants:
         _mark_event(db, event_id, 'skipped')
         return False
@@ -1366,7 +1382,9 @@ def handle_proximity_conversation(
         event_id,
         'proximity_conversation',
     )
-    participants = extra.get('participants') or []
+    participants = _filter_non_herobot_participants(
+        extra.get('participants')
+    )
     if len(participants) < 2:
         _mark_event(db, event_id, 'skipped')
         return False
@@ -1508,6 +1526,8 @@ def handle_proximity_reply(db, client, config, event):
     if (
         not responder['bot_guid']
         and not responder['npc_spawn_id']
+    ) or is_hero_bot(
+        guid=responder['bot_guid'], name=responder['name']
     ):
         _mark_event(db, event_id, 'skipped')
         return False
@@ -2269,7 +2289,9 @@ def handle_proximity_player_say(
         event_id,
         'proximity_player_say',
     )
-    participants = extra.get('participants') or []
+    participants = _filter_non_herobot_participants(
+        extra.get('participants')
+    )
     if not participants:
         _mark_event(db, event_id, 'skipped')
         return False
@@ -2344,7 +2366,9 @@ def handle_proximity_player_conversation(
         event_id,
         'proximity_player_conversation',
     )
-    participants = extra.get('participants') or []
+    participants = _filter_non_herobot_participants(
+        extra.get('participants') or []
+    )
     if len(participants) < 2:
         _mark_event(db, event_id, 'skipped')
         return False
@@ -2660,10 +2684,17 @@ def handle_proximity_player_emote(
         event_id,
         'proximity_player_emote',
     )
-    participants = extra.get('participants') or []
+    participants = _filter_non_herobot_participants(
+        extra.get('participants') or []
+    )
     player_emote = extra.get('player_emote', '')
     addressed = extra.get('addressed_name', '')
-    if not participants or not player_emote or not addressed:
+    if (
+        not participants
+        or not player_emote
+        or not addressed
+        or is_hero_bot(name=addressed)
+    ):
         _mark_event(db, event_id, 'skipped')
         return False
 

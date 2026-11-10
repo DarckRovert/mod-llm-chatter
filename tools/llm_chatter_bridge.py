@@ -61,6 +61,7 @@ from chatter_shared import (
     parse_extra_data,
     wait_for_database,
     stagger_if_needed,
+    is_hero_bot,
 )
 from chatter_events import (
     cleanup_expired_events,
@@ -232,6 +233,15 @@ def process_pending_requests(
                 'level': request['bot1_level'],
                 'zone': request['bot1_zone']
             }
+            if is_hero_bot(guid=bot.get('guid'), name=bot.get('name')):
+                cursor.execute(
+                    "UPDATE llm_chatter_queue "
+                    "SET status = 'cancelled' "
+                    "WHERE id = %s",
+                    (request_id,),
+                )
+                db.commit()
+                return False
             success = process_statement(
                 db, cursor, client,
                 config, request, bot
@@ -297,6 +307,20 @@ def process_pending_requests(
                 bots.append(_make_bot(
                     'bot4', request['bot1_zone']
                 ))
+
+            bots = [
+                b for b in bots
+                if not is_hero_bot(guid=b.get('guid'), name=b.get('name'))
+            ]
+            if len(bots) < 2:
+                cursor.execute(
+                    "UPDATE llm_chatter_queue "
+                    "SET status = 'cancelled' "
+                    "WHERE id = %s",
+                    (request_id,),
+                )
+                db.commit()
+                return False
 
             success = process_conversation(
                 db, cursor, client,
@@ -776,6 +800,21 @@ def process_single_event(event, client, config):
         # Route known events via map.
         handler = EVENT_HANDLERS.get(event_type)
         if handler is not None:
+            # HeroBot Sovereign Gate (Hito #341): HeroBots (Jaina 1002, Varian 1003, Thrall 2284, Sylvanas 1005)
+            # pertenecen en exclusiva al pipeline de LoreEngine/01_LoreBot. mod-llm-chatter jamás debe hablar en su nombre.
+            extra = parse_extra_data(event.get('extra_data', ''))
+            bot_guid = event.get('subject_guid') or extra.get('bot_guid') or extra.get('reactor_guid')
+            bot_name = event.get('subject_name') or extra.get('bot_name') or extra.get('reactor_name')
+            if is_hero_bot(guid=bot_guid, name=bot_name):
+                cursor.execute(
+                    "UPDATE llm_chatter_events "
+                    "SET status = 'skipped' "
+                    "WHERE id = %s",
+                    (event_id,)
+                )
+                db.commit()
+                return False
+
             # Master GroupChatter toggle. The C++ delivery
             # guard is the authoritative, immediate gate
             # (this bridge config is static until restart);

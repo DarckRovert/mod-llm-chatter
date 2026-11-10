@@ -4,6 +4,7 @@ import logging
 import random
 from typing import Dict, List, Optional, Tuple
 
+from chatter_constants import is_hero_bot
 from chatter_db import insert_chat_message
 from chatter_identity import prepare_guild_speakers
 from chatter_general import _pick_length_hint
@@ -189,7 +190,12 @@ def _normalize_candidates(extra: Dict) -> List[Dict]:
             continue
         guid = _safe_int(raw.get('guid'))
         name = str(raw.get('name') or '').strip()
-        if not guid or not name or guid in seen:
+        if (
+            not guid
+            or not name
+            or is_hero_bot(guid=guid, name=name)
+            or guid in seen
+        ):
             continue
         speaker = raw.get('speaker') or {}
         if not speaker:

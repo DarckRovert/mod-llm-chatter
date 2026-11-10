@@ -28,6 +28,9 @@ from chatter_constants import (
     ARMOR_SUBCLASS_NAMES, CLASS_BITMASK,
     EMOTE_KEYWORDS,
     EMOTE_LIST_STR,
+    HEROBOT_EXCLUDED_GUIDS,
+    HEROBOT_EXCLUDED_NAMES,
+    is_hero_bot,
 )
 from chatter_text import (
     strip_speaker_prefix,
@@ -2423,6 +2426,14 @@ def run_single_reaction(
       {'ok': bool, 'message': str|None, 'emote': str|None,
        'error_reason': str|None}
     """
+    if is_hero_bot(guid=bot_guid, name=speaker_name):
+        return {
+            'ok': False,
+            'message': None,
+            'emote': None,
+            'error_reason': 'herobot_excluded',
+        }
+
     # ---- per-bot speaker cooldown ----
     if not bypass_speaker_cooldown:
         cooldown = get_effective_speaker_cooldown(
@@ -3797,6 +3808,3 @@ def append_speaker_gear(parts, bot, indent='  ') -> None:
         parts.append(f"{indent}{line}")
 
 
-# =============================================================================
-# CENTRALIZED MESSAGE INSERTION
-# =============================================================================

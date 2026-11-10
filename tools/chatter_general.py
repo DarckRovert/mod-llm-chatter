@@ -44,6 +44,7 @@ from chatter_shared import (
     build_zone_metadata,
     build_talent_context,
     shorten_chat_message,
+    is_hero_bot,
 )
 from chatter_prompts import (
     maybe_get_creative_twist,
@@ -271,7 +272,10 @@ def _filter_player_general_candidates(
     candidates = []
     for bot_guid, bot_name in zip(bot_guids, bot_names):
         try:
-            candidates.append((int(bot_guid), bot_name))
+            guid_int = int(bot_guid)
+            if is_hero_bot(guid=guid_int, name=bot_name):
+                continue
+            candidates.append((guid_int, bot_name))
         except (TypeError, ValueError):
             continue
     if not candidates:
@@ -377,6 +381,8 @@ def _add_recent_general_speakers(
     rows = cursor.fetchall()
     cursor.close()
     for row in rows:
+        if is_hero_bot(guid=row.get('guid'), name=row.get('name')):
+            continue
         if get_race_faction(row.get('race')) != player_faction:
             continue
         bot_guids.append(int(row['guid']))

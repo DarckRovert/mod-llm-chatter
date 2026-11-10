@@ -11,6 +11,7 @@ post_success callback.
 import logging
 import random
 
+from chatter_constants import is_hero_bot
 from chatter_shared import (
     parse_extra_data,
     get_class_name,
@@ -183,8 +184,8 @@ def run_group_handler(
         )
         return False
 
-    # 4. Guard
-    if not bot_guid or not group_id:
+    # 4. Guard (plus HeroBot Sovereignty Gate)
+    if not bot_guid or not group_id or is_hero_bot(guid=bot_guid, name=bot_name):
         _mark_event(db, event_id, 'skipped')
         return False
 

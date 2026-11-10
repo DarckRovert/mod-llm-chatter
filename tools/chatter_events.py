@@ -10,7 +10,7 @@ import logging
 import re
 
 from chatter_constants import (
-    EVENT_DESCRIPTIONS, CLASS_NAMES, RACE_NAMES,
+    EVENT_DESCRIPTIONS, CLASS_NAMES, RACE_NAMES, is_hero_bot,
 )
 from chatter_shared import (
     parse_extra_data, get_zone_name,
@@ -682,7 +682,7 @@ def process_zone_intrusion_event(
     defender_name = extra_data.get(
         'defender_name', 'Unknown'
     )
-    if not defender_guid:
+    if not defender_guid or is_hero_bot(guid=defender_guid, name=defender_name):
         return True
 
     # Build prompt

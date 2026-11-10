@@ -11,6 +11,7 @@ import random
 import time
 from typing import Dict, List, Optional
 
+from chatter_constants import is_hero_bot
 from chatter_db import (
     get_real_player_guid_for_group,
     get_group_location,
@@ -148,6 +149,10 @@ def _fetch_group_candidates(
         responders = [
             b for b in bots
             if int(b.get('bot_guid') or 0) != source_bot_guid
+            and not is_hero_bot(
+                guid=b.get('bot_guid'),
+                name=b.get('bot_name'),
+            )
             and get_race_faction(b.get('race'))
             == player_faction
         ]
@@ -380,7 +385,11 @@ def _fetch_group_bots(db, group_id: int, source_bot_guid: int) -> List[Dict]:
     cursor.close()
     return [
         _row_to_bot(row) for row in rows
-        if get_race_faction(row.get('race'))
+        if not is_hero_bot(
+            guid=row.get('bot_guid'),
+            name=row.get('bot_name'),
+        )
+        and get_race_faction(row.get('race'))
         == player_faction
     ]
 
