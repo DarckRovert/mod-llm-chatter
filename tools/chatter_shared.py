@@ -1593,6 +1593,16 @@ def get_language_rule() -> str:
         "NEVER output system meta-instructions, token counts, or reasoning commentary."
         if _language == 'Spanish' else ""
     )
+    if _language == 'Spanish':
+        return (
+            "\nIdioma Obligatorio: Escribe TODO en español castellano canónico de World of Warcraft. "
+            "Tanto el campo \"message\" como el campo \"action\" deben estar 100% en español puro. "
+            "Usa siempre los términos y nombres canónicos en español: 'Ventormenta' (NUNCA Stormwind), 'Forjaz' (NUNCA Ironforge), "
+            "'enanos' (NUNCA dwarves), 'orcos' (NUNCA orcs), 'renegados' (NUNCA undeads), 'Kirin Tor', 'Theramore'. "
+            "No mezcles inglés bajo ninguna circunstancia. "
+            f"{grammar_hint}"
+        )
+
     return (
         f"\nLanguage: Write EVERY field in {_language} — "
         "the \"message\" field AND the \"action\" "
